@@ -47,9 +47,7 @@ def _setup_logger() -> logging.Logger:
         logger.setLevel(logging.DEBUG)
         handler = logging.StreamHandler()
         handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-            )
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
         logger.addHandler(handler)
         logger.propagate = False
@@ -64,7 +62,7 @@ log = _setup_logger()
 # is appended to the chat) we check for this marker in the existing
 # assistant messages and bail out immediately rather than starting a
 # second research run.
-_DONE_MARKER = "<!-- deep-research-complete -->"
+_DONE_MARKER = "\n\n---DEEP-RESEARCH-COMPLETE---"
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +215,7 @@ class Pipe:
             "max_tokens": max_tokens,
         }
         try:
-            response = await generate_chat_completion(
-                request, payload, user=user
-            )
+            response = await generate_chat_completion(request, payload, user=user)
             if isinstance(response, dict):
                 return (
                     response.get("choices", [{}])[0]
@@ -278,52 +274,14 @@ class Pipe:
                 {"type": "status", "data": {"description": desc, "done": done}}
             )
 
-    async def _emit_message(
-        self, emitter: Optional[Callable], content: str
-    ) -> None:
-        """Append to the assistant message (persisted in chat DB)."""
-        if emitter:
-            await emitter(
-                {"type": "message", "data": {"content": content}}
-            )
-
-    async def _emit_replace(
-        self, emitter: Optional[Callable], content: str
-    ) -> None:
+    async def _emit_replace(self, emitter: Optional[Callable], content: str) -> None:
         """Replace the full assistant message (persisted in chat DB)."""
         if emitter:
-            await emitter(
-                {"type": "replace", "data": {"content": content}}
-            )
+            await emitter({"type": "replace", "data": {"content": content}})
 
-    async def _emit_citation(
-        self,
-        emitter: Optional[Callable],
-        url: str,
-        title: str,
-        snippet: str,
-    ) -> None:
-        if emitter:
-            await emitter(
-                {
-                    "type": "citation",
-                    "data": {
-                        "document": [snippet[:500]],
-                        "metadata": [
-                            {
-                                "date_accessed": time.strftime(
-                                    "%Y-%m-%d %H:%M:%S"
-                                ),
-                                "source": {
-                                    "name": title or url,
-                                    "url": url,
-                                },
-                            }
-                        ],
-                        "source": {"name": title or url, "url": url},
-                    },
-                }
-            )
+    async def _emit_citation(self, emitter, url: str, title: str, snippet: str):
+        # citations will be included in the report text instead
+        pass
 
     # -----------------------------------------------------------------------
     # Web fetching
@@ -335,9 +293,7 @@ class Pipe:
         try:
             async with session.get(
                 url,
-                timeout=aiohttp.ClientTimeout(
-                    total=self.valves.PAGE_FETCH_TIMEOUT
-                ),
+                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
                 headers={
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -357,9 +313,7 @@ class Pipe:
                     if "pdf" in ct.lower():
                         text = await self._extract_pdf(await resp.read())
                     else:
-                        text = self._html_to_text(
-                            await resp.text(errors="replace")
-                        )
+                        text = self._html_to_text(await resp.text(errors="replace"))
         except Exception as e:
             log.debug(f"Direct fetch failed for {url}: {e}")
 
@@ -368,15 +322,10 @@ class Pipe:
 
         words = text.split()
         if len(words) > self.valves.SNIPPET_MAX_WORDS:
-            text = (
-                " ".join(words[: self.valves.SNIPPET_MAX_WORDS])
-                + " [...]"
-            )
+            text = " ".join(words[: self.valves.SNIPPET_MAX_WORDS]) + " [...]"
         return url, text
 
-    async def _flaresolverr(
-        self, session: aiohttp.ClientSession, url: str
-    ) -> str:
+    async def _flaresolverr(self, session: aiohttp.ClientSession, url: str) -> str:
         try:
             async with session.post(
                 self.valves.FLARESOLVERR_URL,
@@ -402,12 +351,18 @@ class Pipe:
     def _html_to_text(html: str) -> str:
         text = re.sub(
             r"<(script|style|noscript)[^>]*>.*?</\1>",
-            "", html, flags=re.DOTALL | re.IGNORECASE,
+            "",
+            html,
+            flags=re.DOTALL | re.IGNORECASE,
         )
         text = re.sub(r"<[^>]+>", " ", text)
         for ent, ch in [
-            ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
-            ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " "),
+            ("&amp;", "&"),
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", '"'),
+            ("&#39;", "'"),
+            ("&nbsp;", " "),
         ]:
             text = text.replace(ent, ch)
         return re.sub(r"\s+", " ", text).strip()
@@ -415,11 +370,9 @@ class Pipe:
     async def _extract_pdf(self, data: bytes) -> str:
         try:
             import pypdf
+
             reader = pypdf.PdfReader(BytesIO(data))
-            return "\n".join(
-                p.extract_text() for p in reader.pages
-                if p.extract_text()
-            )
+            return "\n".join(p.extract_text() for p in reader.pages if p.extract_text())
         except ImportError:
             return "[PDF — pypdf not installed]"
         except Exception:
@@ -483,8 +436,7 @@ class Pipe:
             for r in (await self._search(session, eq))[:5]:
                 if r["snippet"]:
                     snippets.append(
-                        f"- [{r['title']}]({r['url']}): "
-                        f"{r['snippet'][:200]}"
+                        f"- [{r['title']}]({r['url']}): " f"{r['snippet'][:200]}"
                     )
 
         ctx = "\n".join(snippets[:20])
@@ -517,7 +469,9 @@ Guidelines:
 
         raw = await self._llm_call(
             [{"role": "user", "content": prompt}],
-            request, user, temperature=0.4,
+            request,
+            user,
+            temperature=0.4,
         )
         raw = re.sub(r"```(?:json)?\s*", "", raw)
         raw = re.sub(r"```\s*$", "", raw).strip()
@@ -534,9 +488,7 @@ Guidelines:
                         "search_queries": [query, f"{query} overview"],
                     }
                 ],
-                "initial_queries": [
-                    query, f"{query} latest", f"{query} analysis"
-                ],
+                "initial_queries": [query, f"{query} latest", f"{query} analysis"],
             }
 
         text = "## 📋 Research Plan\n\n"
@@ -567,14 +519,11 @@ Guidelines:
         # Build de-duped query queue
         queue: List[str] = []
         seen_q: set = set()
-        for q in (
-            plan.get("initial_queries", [query])
-            + [
-                sq
-                for sec in plan.get("sections", [])
-                for sq in sec.get("search_queries", [])
-            ]
-        ):
+        for q in plan.get("initial_queries", [query]) + [
+            sq
+            for sec in plan.get("sections", [])
+            for sq in sec.get("search_queries", [])
+        ]:
             ql = q.strip().lower()
             if ql and ql not in seen_q:
                 seen_q.add(ql)
@@ -600,21 +549,15 @@ Guidelines:
                     qi += 1
 
             if not cqs and cycle <= self.valves.MIN_RESEARCH_CYCLES:
-                await self._emit_status(
-                    emitter, "🧠 Generating follow-up queries…"
-                )
-                cqs = await self._followup_queries(
-                    query, collected, request, user
-                )
+                await self._emit_status(emitter, "🧠 Generating follow-up queries…")
+                cqs = await self._followup_queries(query, collected, request, user)
             elif not cqs:
                 break
 
             # Search
             results: List[Dict[str, str]] = []
             for cq in cqs:
-                await self._emit_status(
-                    emitter, f"🔍 Searching: {cq[:80]}…"
-                )
+                await self._emit_status(emitter, f"🔍 Searching: {cq[:80]}…")
                 for r in await self._search(session, cq):
                     if r["url"] and r["url"] not in seen_urls:
                         results.append(r)
@@ -652,9 +595,7 @@ Guidelines:
                         if r["url"] == url:
                             title = r.get("title", url)
                             break
-                    collected.append(
-                        {"url": url, "title": title, "content": text}
-                    )
+                    collected.append({"url": url, "title": title, "content": text})
                     if url not in source_urls:
                         source_urls.append(url)
                     new += 1
@@ -668,12 +609,8 @@ Guidelines:
             # Compress if too large
             tw = sum(len(s["content"].split()) for s in collected)
             if tw > self.valves.MAX_TOTAL_CONTEXT_WORDS:
-                await self._emit_status(
-                    emitter, "📦 Compressing older notes…"
-                )
-                collected = await self._compress(
-                    query, collected, request, user
-                )
+                await self._emit_status(emitter, "📦 Compressing older notes…")
+                collected = await self._compress(query, collected, request, user)
 
             # LLM decides whether to continue
             if cycle >= self.valves.MIN_RESEARCH_CYCLES:
@@ -707,7 +644,9 @@ Guidelines:
                     ),
                 }
             ],
-            request, user, temperature=0.5,
+            request,
+            user,
+            temperature=0.5,
         )
         raw = re.sub(r"```(?:json)?\s*", "", raw)
         raw = re.sub(r"```\s*$", "", raw).strip()
@@ -743,7 +682,10 @@ Guidelines:
                     ),
                 }
             ],
-            request, user, temperature=0.2, max_tokens=100,
+            request,
+            user,
+            temperature=0.2,
+            max_tokens=100,
         )
         return r.strip().upper().startswith("CONTINUE")
 
@@ -753,8 +695,7 @@ Guidelines:
         sp = len(collected) // 2
         old, recent = collected[:sp], collected[sp:]
         old_text = "\n\n".join(
-            f"Source: {s['title']} ({s['url']})\n{s['content']}"
-            for s in old
+            f"Source: {s['title']} ({s['url']})\n{s['content']}" for s in old
         )
         summary = await self._llm_call(
             [
@@ -767,7 +708,10 @@ Guidelines:
                     ),
                 }
             ],
-            request, user, temperature=0.2, max_tokens=3000,
+            request,
+            user,
+            temperature=0.2,
+            max_tokens=3000,
         )
         return [
             {
@@ -804,9 +748,7 @@ Guidelines:
             f"- {s['title']}: {s.get('description','')}"
             for s in plan.get("sections", [])
         )
-        refs = "\n".join(
-            f"[{i+1}] {u}" for i, u in enumerate(source_urls)
-        )
+        refs = "\n".join(f"[{i+1}] {u}" for i, u in enumerate(source_urls))
 
         smin = self.valves.SECTION_MIN_WORDS
         smax = self.valves.SECTION_MAX_WORDS
@@ -857,7 +799,8 @@ GUIDELINES:
 
         return await self._llm_call(
             [{"role": "user", "content": prompt}],
-            request, user,
+            request,
+            user,
             temperature=0.3,
             max_tokens=self.valves.REPORT_MAX_TOKENS,
         )
@@ -880,25 +823,17 @@ GUIDELINES:
             p.append(f"**Topic:** {plan.get('plan_summary','')}\n")
             ss = plan.get("sections", [])
             if ss:
-                p.append(
-                    f"**Sections:** "
-                    f"{', '.join(s['title'] for s in ss)}\n"
-                )
+                p.append(f"**Sections:** " f"{', '.join(s['title'] for s in ss)}\n")
         if max_cycles:
             p.append(
                 f"**Progress:** cycle {cycle}/{max_cycles} · "
                 f"{snippets} snippets · {sources} sources\n"
             )
         if urls:
-            p.append(
-                "\n<details><summary>Sources found so far</summary>\n"
-            )
+            p.append("\nSources found so far\n")
             for i, u in enumerate(urls, 1):
                 p.append(f"{i}. {u}")
-            p.append("\n</details>\n")
-        p.append(
-            "\n*Research in progress — this updates automatically…*\n"
-        )
+        p.append("\n*Research in progress — this updates automatically…*\n")
         return "\n".join(p)
 
     # -----------------------------------------------------------------------
@@ -908,12 +843,8 @@ GUIDELINES:
         self,
         body: dict,
         __user__: Optional[dict] = None,
-        __event_emitter__: Optional[
-            Callable[[dict], Awaitable[None]]
-        ] = None,
-        __event_call__: Optional[
-            Callable[[dict], Awaitable[Any]]
-        ] = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+        __event_call__: Optional[Callable[[dict], Awaitable[Any]]] = None,
         __request__: Optional[Any] = None,
         __task__: Optional[str] = None,
         __metadata__: Optional[dict] = None,
@@ -989,7 +920,7 @@ GUIDELINES:
         all_messages = body.get("messages", [])
         for msg in all_messages:
             if msg.get("role") == "assistant":
-                content = msg.get("content", "")
+                content = msg.get("content")
                 if isinstance(content, str) and _DONE_MARKER in content:
                     log.info("Re-entry guard: report exists, skipping")
                     return ""
@@ -1010,21 +941,19 @@ GUIDELINES:
                 # ======================================================
                 # PHASE 1 — plan
                 # ======================================================
-                await self._emit_status(
-                    __event_emitter__, "🚀 Starting deep research…"
-                )
+                await self._emit_status(__event_emitter__, "🚀 Starting deep research…")
                 plan_text, _, plan = await self._generate_plan(
-                    user_query, __request__, user_obj,
-                    session, __event_emitter__,
+                    user_query,
+                    __request__,
+                    user_obj,
+                    session,
+                    __event_emitter__,
                 )
 
                 # ======================================================
                 # PLAN CONFIRMATION (only user interaction point)
                 # ======================================================
-                if (
-                    not self.valves.SKIP_PLAN_CONFIRMATION
-                    and __event_call__
-                ):
+                if not self.valves.SKIP_PLAN_CONFIRMATION and __event_call__:
                     await self._emit_status(
                         __event_emitter__,
                         "⏳ Waiting for plan confirmation…",
@@ -1039,25 +968,29 @@ GUIDELINES:
                                     "Type **ok** or **yes** to proceed, "
                                     "or describe changes you'd like."
                                 ),
-                                "placeholder": (
-                                    "ok / yes / your modifications…"
-                                ),
+                                "placeholder": ("ok / yes / your modifications…"),
                             },
                         }
                     )
 
                     resp = ""
                     if isinstance(confirmation, dict):
-                        resp = str(
-                            confirmation.get("value", "")
-                        ).strip().lower()
+                        resp = str(confirmation.get("value", "")).strip().lower()
                     elif isinstance(confirmation, str):
                         resp = confirmation.strip().lower()
 
                     if resp not in {
-                        "ok", "yes", "y", "continue", "proceed",
-                        "go", "looks good", "lgtm", "approve",
-                        "confirmed", "",
+                        "ok",
+                        "yes",
+                        "y",
+                        "continue",
+                        "proceed",
+                        "go",
+                        "looks good",
+                        "lgtm",
+                        "approve",
+                        "confirmed",
+                        "",
                     }:
                         await self._emit_status(
                             __event_emitter__,
@@ -1076,7 +1009,9 @@ GUIDELINES:
                                     ),
                                 }
                             ],
-                            __request__, user_obj, temperature=0.4,
+                            __request__,
+                            user_obj,
+                            temperature=0.4,
                         )
                         mod = re.sub(r"```(?:json)?\s*", "", mod)
                         mod = re.sub(r"```\s*$", "", mod).strip()
@@ -1088,22 +1023,22 @@ GUIDELINES:
                 # ======================================================
                 # Write initial progress into message body
                 # ======================================================
-                await self._emit_message(
+                await self._emit_replace(
                     __event_emitter__,
-                    self._progress_msg(
-                        "Starting research…", plan=plan
-                    ),
+                    self._progress_msg("Starting research…", plan=plan),
                 )
 
                 # ======================================================
                 # PHASE 2 — research loop (autonomous, no user prompts)
                 # ======================================================
-                await self._emit_status(
-                    __event_emitter__, "🔬 Researching…"
-                )
+                await self._emit_status(__event_emitter__, "🔬 Researching…")
                 collected, source_urls = await self._research_loop(
-                    user_query, plan, __request__, user_obj,
-                    session, __event_emitter__,
+                    user_query,
+                    plan,
+                    __request__,
+                    user_obj,
+                    session,
+                    __event_emitter__,
                 )
 
                 if not collected:
@@ -1114,9 +1049,10 @@ GUIDELINES:
                     await self._emit_replace(__event_emitter__, msg)
                     await self._emit_status(
                         __event_emitter__,
-                        "⚠️ No data collected", done=True,
+                        "⚠️ No data collected",
+                        done=True,
                     )
-                    return ""
+                    return "⚠️ No data collected"
 
                 # Update progress
                 await self._emit_replace(
@@ -1136,23 +1072,27 @@ GUIDELINES:
                 # PHASE 3 — report
                 # ======================================================
                 report = await self._generate_report(
-                    user_query, plan, collected, source_urls,
-                    __request__, user_obj, __event_emitter__,
+                    user_query,
+                    plan,
+                    collected,
+                    source_urls,
+                    __request__,
+                    user_obj,
+                    __event_emitter__,
                 )
 
                 # Append the done-marker so the re-entry guard works
-                report_with_marker = report + "\n\n" + _DONE_MARKER
+                report_with_marker = report + _DONE_MARKER
 
-                await self._emit_replace(
-                    __event_emitter__, report_with_marker
-                )
+                await self._emit_replace(__event_emitter__, report_with_marker)
 
                 # Citations
                 for s in collected:
                     if s["url"] and s["url"] != "compressed_summary":
                         await self._emit_citation(
                             __event_emitter__,
-                            s["url"], s["title"],
+                            s["url"],
+                            s["title"],
                             s["content"][:300],
                         )
 
@@ -1173,6 +1113,7 @@ GUIDELINES:
             log.error(f"Deep Research error: {e}", exc_info=True)
             await self._emit_status(
                 __event_emitter__,
-                f"❌ Failed: {e}", done=True,
+                f"❌ Failed: {e}",
+                done=True,
             )
             return f"Research error: {e}"
