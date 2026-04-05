@@ -1,210 +1,195 @@
 """
 title: Smart Web Search
-description: A tool that lets the LLM search the web when it lacks knowledge to answer a question. The model crafts its own search queries and can fetch full page content for deeper research. Supports SearXNG, Tavily, and any SearXNG-compatible API. Optionally uses FlareSolverr to bypass bot protection on fetched pages.
-author: mdelponte
-version: 2.0.0
+description: An intelligent web search tool that lets the model decide when it needs external knowledge. Uses SearXNG for search, scrapes pages for full content, falls back to FlareSolverr for captcha-blocked pages, and handles PDFs. The model formulates its own search queries and iterates until it has enough information to answer.
+author: Claude
+version: 1.0.0
 license: MIT
-requirements: requests, beautifulsoup4
+requirements: beautifulsoup4, requests
 """
 
 import json
-import random
+import logging
+import re
+import asyncio
+import concurrent.futures
+from typing import Callable, Any, Optional, List, Dict
+from urllib.parse import urlparse, urljoin, quote_plus
+
 import requests
-from typing import Callable, Any
-from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
-# Realistic browser User-Agent strings to rotate through
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-]
+# ---------------------------------------------------------------------------
+# Event emitter helper
+# ---------------------------------------------------------------------------
+class EventEmitter:
+    """Convenience wrapper around Open WebUI's __event_emitter__ callback."""
 
+    def __init__(self, event_emitter: Callable[[dict], Any]):
+        self.event_emitter = event_emitter
 
-class Tools:
-    class Valves(BaseModel):
-        SEARCH_ENGINE_URL: str = Field(
-            default="http://searxng:8080/search",
-            description="The search API endpoint URL. For SearXNG use the /search endpoint (e.g. http://searxng:8080/search). For Tavily use https://api.tavily.com/search.",
-        )
-        SEARCH_ENGINE_TYPE: str = Field(
-            default="searxng",
-            description="Type of search engine: 'searxng' or 'tavily'.",
-        )
-        SEARCH_API_KEY: str = Field(
-            default="",
-            description="API key for the search engine (required for Tavily, optional for SearXNG if auth is enabled).",
-        )
-        MAX_SEARCH_RESULTS: int = Field(
-            default=5,
-            description="Maximum number of search results to return per query.",
-        )
-        MAX_CONTENT_LENGTH: int = Field(
-            default=4000,
-            description="Maximum character length of fetched page content to return to the model.",
-        )
-        FETCH_TIMEOUT: int = Field(
-            default=15,
-            description="Timeout in seconds for HTTP requests.",
-        )
-        SEARCH_CATEGORIES: str = Field(
-            default="general",
-            description="Comma-separated SearXNG categories to search (e.g. 'general,it,science'). Only used for SearXNG.",
-        )
-        FETCH_FULL_PAGE: bool = Field(
-            default=True,
-            description="When enabled, the fetch_page tool is available for the model to read full webpage content.",
-        )
-        FLARESOLVERR_URL: str = Field(
-            default="",
-            description="FlareSolverr endpoint URL (e.g. http://flaresolverr:8191/v1). Leave empty to disable. Used as a fallback when direct fetch fails due to bot protection.",
-        )
-        RETRY_WITH_FLARESOLVERR: bool = Field(
-            default=True,
-            description="When enabled, if a direct page fetch fails (403, captcha, etc.), automatically retry through FlareSolverr.",
-        )
-
-    class UserValves(BaseModel):
-        SHOW_STATUS_UPDATES: bool = Field(
-            default=True,
-            description="Show status messages during search and fetch operations.",
-        )
-
-    def __init__(self):
-        self.valves = self.Valves()
-
-    def _get_headers(self) -> dict:
-        """Get request headers with a random realistic User-Agent."""
-        ua = random.choice(USER_AGENTS)
-        return {
-            "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0",
-        }
-
-    async def _emit_status(
+    async def emit(
         self,
-        __event_emitter__: Callable[[dict], Any],
         description: str,
+        status: str = "in_progress",
         done: bool = False,
     ):
-        """Emit a status update to the UI."""
-        if __event_emitter__:
-            await __event_emitter__(
+        if self.event_emitter:
+            await self.event_emitter(
                 {
                     "type": "status",
                     "data": {
-                        "status": "complete" if done else "in_progress",
+                        "status": status,
                         "description": description,
                         "done": done,
                     },
                 }
             )
 
-    async def _emit_source(
-        self,
-        __event_emitter__: Callable[[dict], Any],
-        url: str,
-        title: str,
-    ):
-        """Emit a source citation to the UI."""
-        if __event_emitter__:
-            await __event_emitter__(
+    async def citation(self, title: str, url: str, content: str):
+        if self.event_emitter:
+            await self.event_emitter(
                 {
                     "type": "citation",
                     "data": {
-                        "document": [title],
-                        "metadata": [{"source": url, "html": False}],
+                        "document": [content[:1000]],
+                        "metadata": [{"source": url, "title": title}],
                         "source": {"name": title, "url": url},
                     },
                 }
             )
 
-    def _search_searxng(self, query: str) -> list[dict]:
-        """Execute a search against a SearXNG instance."""
-        params = {
-            "q": query,
-            "format": "json",
-            "categories": self.valves.SEARCH_CATEGORIES,
-        }
-        headers = {}
-        if self.valves.SEARCH_API_KEY:
-            headers["Authorization"] = f"Bearer {self.valves.SEARCH_API_KEY}"
+    async def error(self, description: str):
+        await self.emit(description=description, status="error", done=True)
 
-        response = requests.get(
-            self.valves.SEARCH_ENGINE_URL,
-            params=params,
-            headers=headers,
-            timeout=self.valves.FETCH_TIMEOUT,
+    async def done(self, description: str = "Complete"):
+        await self.emit(description=description, status="complete", done=True)
+
+
+# ---------------------------------------------------------------------------
+# Page scraping helpers
+# ---------------------------------------------------------------------------
+class PageScraper:
+    """Fetches and extracts text from web pages with FlareSolverr fallback."""
+
+    CAPTCHA_INDICATORS = [
+        "captcha",
+        "cf-challenge",
+        "challenge-platform",
+        "just a moment",
+        "checking your browser",
+        "ray id",
+        "attention required",
+        "access denied",
+        "blocked",
+        "security check",
+        "ddos protection",
+    ]
+
+    def __init__(self, valves):
+        self.valves = valves
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": valves.USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            }
         )
-        response.raise_for_status()
-        data = response.json()
 
-        results = []
-        for r in data.get("results", [])[: self.valves.MAX_SEARCH_RESULTS]:
-            results.append(
-                {
-                    "title": r.get("title", ""),
-                    "url": r.get("url", ""),
-                    "snippet": r.get("content", ""),
-                    "engine": r.get("engine", ""),
-                }
-            )
-        return results
+    def _looks_blocked(self, response: requests.Response) -> bool:
+        """Heuristic check for captcha / anti-bot pages."""
+        if response.status_code in (403, 429, 503):
+            return True
+        body_lower = response.text[:5000].lower()
+        hits = sum(1 for indicator in self.CAPTCHA_INDICATORS if indicator in body_lower)
+        # If the page is very short AND has indicators, it's likely a block page
+        if hits >= 2:
+            return True
+        if response.status_code == 200 and len(response.text) < 2000 and hits >= 1:
+            return True
+        return False
 
-    def _search_tavily(self, query: str) -> list[dict]:
-        """Execute a search against the Tavily API."""
-        payload = {
-            "api_key": self.valves.SEARCH_API_KEY,
-            "query": query,
-            "max_results": self.valves.MAX_SEARCH_RESULTS,
-            "include_answer": False,
-        }
-        response = requests.post(
-            self.valves.SEARCH_ENGINE_URL,
-            json=payload,
-            timeout=self.valves.FETCH_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
+    def _is_pdf_url(self, url: str, response: Optional[requests.Response] = None) -> bool:
+        """Check if a URL points to a PDF."""
+        if url.lower().endswith(".pdf"):
+            return True
+        if response and "application/pdf" in response.headers.get("Content-Type", ""):
+            return True
+        return False
 
-        results = []
-        for r in data.get("results", []):
-            results.append(
-                {
-                    "title": r.get("title", ""),
-                    "url": r.get("url", ""),
-                    "snippet": r.get("content", ""),
-                    "engine": "tavily",
-                }
-            )
-        return results
+    def _extract_pdf_text(self, content: bytes) -> str:
+        """
+        Extract text from PDF bytes.
+        Tries PyPDF2/pypdf first (commonly available in Open WebUI),
+        then falls back to a basic binary extraction.
+        """
+        # Try pypdf (the modern fork, often available in Open WebUI)
+        try:
+            import pypdf
+            import io
 
-    def _extract_text(self, html: str) -> str:
-        """Extract clean text content from HTML."""
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            text_parts = []
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+            if text_parts:
+                return "\n\n".join(text_parts)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"pypdf extraction failed: {e}")
+
+        # Try PyPDF2 (legacy, but also commonly installed)
+        try:
+            import PyPDF2
+            import io
+
+            reader = PyPDF2.PdfReader(io.BytesIO(content))
+            text_parts = []
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+            if text_parts:
+                return "\n\n".join(text_parts)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"PyPDF2 extraction failed: {e}")
+
+        # Try pdfminer (another common option)
+        try:
+            from pdfminer.high_level import extract_text
+            import io
+
+            text = extract_text(io.BytesIO(content))
+            if text and text.strip():
+                return text
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"pdfminer extraction failed: {e}")
+
+        return "[PDF detected but no PDF extraction library available. Install pypdf, PyPDF2, or pdfminer.six.]"
+
+    def _extract_text_from_html(self, html: str, url: str) -> str:
+        """Extract meaningful text content from HTML."""
         soup = BeautifulSoup(html, "html.parser")
 
-        # Remove non-content elements
-        for tag in soup(
-            [
-                "script", "style", "nav", "footer", "header", "aside",
-                "iframe", "noscript", "svg", "form", "button",
-            ]
+        # Remove noise elements
+        for tag in soup.find_all(
+            ["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript"]
         ):
             tag.decompose()
 
@@ -213,269 +198,444 @@ class Tools:
             soup.find("main")
             or soup.find("article")
             or soup.find("div", {"role": "main"})
-            or soup.find("div", {"id": "content"})
-            or soup.find("div", {"class": "content"})
+            or soup.find("div", class_=re.compile(r"(content|article|post|entry|main)", re.I))
         )
-        if main:
-            text = main.get_text(separator="\n", strip=True)
-        else:
-            text = soup.get_text(separator="\n", strip=True)
+
+        target = main if main else soup.body if soup.body else soup
+        text = target.get_text(separator="\n", strip=True)
 
         # Clean up excessive whitespace
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         text = "\n".join(lines)
+
+        # Truncate to configured max
+        max_chars = self.valves.MAX_PAGE_CONTENT_LENGTH
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n\n[Content truncated at {max_chars} characters]"
+
         return text
 
-    def _fetch_direct(self, url: str) -> tuple[str, int]:
-        """
-        Fetch a URL directly with browser-like headers.
-        Returns (html_content, status_code).
-        """
-        response = requests.get(
-            url,
-            headers=self._get_headers(),
-            timeout=self.valves.FETCH_TIMEOUT,
-            allow_redirects=True,
-        )
-        return response.text, response.status_code
+    def _fetch_via_flaresolverr(self, url: str) -> Optional[str]:
+        """Attempt to fetch a page through FlareSolverr to bypass captchas."""
+        if not self.valves.FLARESOLVERR_URL:
+            return None
 
-    def _fetch_via_flaresolverr(self, url: str) -> str:
-        """
-        Fetch a URL through FlareSolverr to bypass bot protection.
-        Returns the HTML content.
-        """
-        payload = {
-            "cmd": "request.get",
-            "url": url,
-            "maxTimeout": self.valves.FETCH_TIMEOUT * 1000,
-        }
-        response = requests.post(
-            self.valves.FLARESOLVERR_URL,
-            json=payload,
-            timeout=self.valves.FETCH_TIMEOUT + 10,  # Extra time for solver
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("status") == "ok":
-            solution = data.get("solution", {})
-            return solution.get("response", "")
-        else:
-            raise Exception(
-                data.get("message", "FlareSolverr returned a non-ok status")
+        try:
+            payload = {
+                "cmd": "request.get",
+                "url": url,
+                "maxTimeout": self.valves.FLARESOLVERR_TIMEOUT * 1000,
+            }
+            resp = requests.post(
+                self.valves.FLARESOLVERR_URL,
+                json=payload,
+                timeout=self.valves.FLARESOLVERR_TIMEOUT + 10,
             )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("status") == "ok":
+                solution = data.get("solution", {})
+                return solution.get("response", "")
+            else:
+                logger.warning(f"FlareSolverr returned status: {data.get('status')}")
+                return None
+        except Exception as e:
+            logger.error(f"FlareSolverr request failed for {url}: {e}")
+            return None
+
+    def scrape(self, url: str) -> Dict[str, Any]:
+        """
+        Scrape a URL and return extracted content.
+        Returns dict with keys: url, title, content, source, error
+        """
+        result = {"url": url, "title": "", "content": "", "source": "direct", "error": None}
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            url = "https://" + url
+            result["url"] = url
+
+        try:
+            resp = self.session.get(url, timeout=self.valves.REQUEST_TIMEOUT, allow_redirects=True)
+
+            # Handle PDFs
+            if self._is_pdf_url(url, resp):
+                result["title"] = url.split("/")[-1]
+                result["content"] = self._extract_pdf_text(resp.content)
+                result["source"] = "pdf"
+                return result
+
+            # Check if blocked / captcha
+            if self._looks_blocked(resp):
+                logger.info(f"Page appears blocked, trying FlareSolverr: {url}")
+                html = self._fetch_via_flaresolverr(url)
+                if html:
+                    result["source"] = "flaresolverr"
+                else:
+                    result["error"] = "Page blocked by captcha/anti-bot and FlareSolverr unavailable or failed"
+                    # Still try to extract whatever we got
+                    html = resp.text
+            else:
+                resp.raise_for_status()
+                html = resp.text
+
+            soup = BeautifulSoup(html, "html.parser")
+            title_tag = soup.find("title")
+            result["title"] = title_tag.get_text(strip=True) if title_tag else parsed.netloc
+            result["content"] = self._extract_text_from_html(html, url)
+
+        except requests.exceptions.Timeout:
+            result["error"] = f"Request timed out after {self.valves.REQUEST_TIMEOUT}s"
+        except requests.exceptions.ConnectionError:
+            result["error"] = "Connection failed"
+        except requests.exceptions.HTTPError as e:
+            # Try FlareSolverr as fallback for HTTP errors
+            logger.info(f"HTTP error {e}, trying FlareSolverr: {url}")
+            html = self._fetch_via_flaresolverr(url)
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
+                title_tag = soup.find("title")
+                result["title"] = title_tag.get_text(strip=True) if title_tag else parsed.netloc
+                result["content"] = self._extract_text_from_html(html, url)
+                result["source"] = "flaresolverr"
+            else:
+                result["error"] = f"HTTP {e.response.status_code if e.response else 'unknown'}"
+        except Exception as e:
+            result["error"] = str(e)
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Main Tool class
+# ---------------------------------------------------------------------------
+class Tools:
+    class Valves(BaseModel):
+        # --- SearXNG Configuration ---
+        SEARXNG_BASE_URL: str = Field(
+            default="http://searxng:8080",
+            description="Base URL of your SearXNG instance (e.g. http://searxng:8080 or http://192.168.1.100:8080)",
+        )
+
+        # --- FlareSolverr Configuration ---
+        FLARESOLVERR_URL: str = Field(
+            default="http://flaresolverr:8191/v1",
+            description="FlareSolverr API endpoint URL. Leave empty to disable FlareSolverr fallback.",
+        )
+        FLARESOLVERR_TIMEOUT: int = Field(
+            default=60,
+            description="Timeout in seconds for FlareSolverr requests",
+        )
+
+        # --- Search Behavior ---
+        SEARCH_RESULTS_COUNT: int = Field(
+            default=5,
+            description="Number of search results to return from SearXNG per query",
+        )
+        PAGES_TO_SCRAPE: int = Field(
+            default=3,
+            description="Number of top search result pages to scrape for full content",
+        )
+        SEARCH_CATEGORIES: str = Field(
+            default="general",
+            description="Comma-separated SearXNG search categories (e.g. general,it,science)",
+        )
+        SEARCH_LANGUAGE: str = Field(
+            default="en",
+            description="Language code for search results (e.g. en, de, fr)",
+        )
+        SEARCH_TIME_RANGE: str = Field(
+            default="",
+            description="Time range filter for search results. Leave empty for no filter. Options: day, week, month, year",
+        )
+
+        # --- Content Processing ---
+        MAX_PAGE_CONTENT_LENGTH: int = Field(
+            default=20000,
+            description="Maximum number of characters to extract per page",
+        )
+        MIN_CONTENT_LENGTH: int = Field(
+            default=50,
+            description="Minimum content length (in characters) for a scraped page to be considered valid",
+        )
+
+        # --- Request Settings ---
+        REQUEST_TIMEOUT: int = Field(
+            default=15,
+            description="Timeout in seconds for direct HTTP requests",
+        )
+        USER_AGENT: str = Field(
+            default="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            description="User-Agent header for HTTP requests",
+        )
+        CONCURRENT_SCRAPE_WORKERS: int = Field(
+            default=3,
+            description="Number of concurrent workers for page scraping",
+        )
+
+        # --- Ignored Domains ---
+        IGNORED_DOMAINS: str = Field(
+            default="",
+            description="Comma-separated list of domains to skip when scraping (e.g. pinterest.com,facebook.com)",
+        )
+
+    class UserValves(BaseModel):
+        SHOW_STATUS_UPDATES: bool = Field(
+            default=True,
+            description="Show status updates during search operations",
+        )
+        INCLUDE_CITATIONS: bool = Field(
+            default=True,
+            description="Include source citations with search results",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    def _get_ignored_domains(self) -> set:
+        """Parse the ignored domains valve into a set."""
+        if not self.valves.IGNORED_DOMAINS.strip():
+            return set()
+        return {d.strip().lower() for d in self.valves.IGNORED_DOMAINS.split(",") if d.strip()}
+
+    def _is_domain_ignored(self, url: str) -> bool:
+        """Check if a URL's domain is in the ignore list."""
+        ignored = self._get_ignored_domains()
+        if not ignored:
+            return False
+        try:
+            domain = urlparse(url).netloc.lower()
+            return any(ignored_domain in domain for ignored_domain in ignored)
+        except Exception:
+            return False
 
     async def search_web(
         self,
         query: str,
         __event_emitter__: Callable[[dict], Any] = None,
-        __user__: dict = {},
+        __user__: Optional[dict] = None,
     ) -> str:
         """
-        Search the web for information. You should use this tool liberally — not just when
-        you are uncertain, but any time your response could be improved with up-to-date data,
-        verified facts, specific references, official documentation, configuration examples,
-        version-specific details, changelogs, or technical accuracy. If the user is asking
-        about a specific technology, product, API, library, tool, error message, configuration,
-        or anything where the correct answer depends on the current version or state of the
-        world, search for it. When a user reports an error or unexpected behavior, search for
-        that error message or symptom. When discussing setup steps, helm charts, config files,
-        or deployment, search for the official docs. Prefer searching over guessing. You should
-        craft a concise, targeted search query yourself — do NOT pass the user's full message.
-        Good queries are 2-8 words focused on the specific fact or document you need.
-        You may call this tool multiple times with different queries to gather information
-        from different angles.
+        Search the web and return the search results with scraped page content.
+        Use this tool when you need current or up-to-date information that you don't have,
+        when you're unsure about specific facts, versions, configurations, or documentation,
+        or when the user's question involves recent events, products, or rapidly changing information.
 
-        :param query: A concise search query you have crafted to find the specific information needed (2-8 words).
-        :return: A JSON string containing search results with titles, URLs, and snippets.
+        You should formulate the search query yourself based on what specific information
+        you need. Keep queries short and focused (1-6 words work best). If the first search
+        doesn't give you what you need, you can call this tool again with a refined query.
+
+        :param query: A concise search query to find the information you need. Formulate this yourself based on what knowledge gap you're trying to fill.
+        :return: A JSON string containing search results with scraped page content, titles, URLs, and snippets.
         """
-        user_valves = __user__.get("valves")
-        if not user_valves:
-            user_valves = self.UserValves()
-        show_status = user_valves.SHOW_STATUS_UPDATES
+        emitter = EventEmitter(__event_emitter__)
+
+        # Get user valve preferences
+        show_status = True
+        include_citations = True
+        if __user__:
+            user_valves = __user__.get("valves")
+            if user_valves:
+                show_status = getattr(user_valves, "SHOW_STATUS_UPDATES", True)
+                include_citations = getattr(user_valves, "INCLUDE_CITATIONS", True)
 
         if show_status:
-            await self._emit_status(__event_emitter__, f"Searching: {query}")
+            await emitter.emit(f"Searching: {query}")
+
+        # --- Step 1: Query SearXNG ---
+        search_url = f"{self.valves.SEARXNG_BASE_URL.rstrip('/')}/search"
+        params = {
+            "q": query,
+            "format": "json",
+            "number_of_results": self.valves.SEARCH_RESULTS_COUNT,
+            "categories": self.valves.SEARCH_CATEGORIES,
+            "language": self.valves.SEARCH_LANGUAGE,
+        }
+        if self.valves.SEARCH_TIME_RANGE:
+            params["time_range"] = self.valves.SEARCH_TIME_RANGE
 
         try:
-            if self.valves.SEARCH_ENGINE_TYPE.lower() == "tavily":
-                results = self._search_tavily(query)
-            else:
-                results = self._search_searxng(query)
+            resp = requests.get(
+                search_url,
+                params=params,
+                headers={"User-Agent": self.valves.USER_AGENT},
+                timeout=self.valves.REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            search_data = resp.json()
+        except requests.exceptions.RequestException as e:
+            await emitter.error(f"Search request failed: {e}")
+            return json.dumps({"error": f"SearXNG search failed: {str(e)}", "results": []})
 
-            if not results:
-                if show_status:
-                    await self._emit_status(
-                        __event_emitter__, "No results found.", done=True
+        raw_results = search_data.get("results", [])
+        if not raw_results:
+            await emitter.done("No search results found")
+            return json.dumps({"query": query, "results": [], "message": "No results found. Try a different or broader search query."})
+
+        # --- Step 2: Filter and deduplicate results ---
+        seen_urls = set()
+        filtered_results = []
+        for r in raw_results:
+            url = r.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            if self._is_domain_ignored(url):
+                continue
+            seen_urls.add(url)
+            filtered_results.append(r)
+
+        if show_status:
+            await emitter.emit(f"Found {len(filtered_results)} results, scraping top pages...")
+
+        # --- Step 3: Scrape top N pages concurrently ---
+        scraper = PageScraper(self.valves)
+        pages_to_scrape = filtered_results[: self.valves.PAGES_TO_SCRAPE]
+        remaining_results = filtered_results[self.valves.PAGES_TO_SCRAPE :]
+
+        scraped_pages = []
+        loop = asyncio.get_event_loop()
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.valves.CONCURRENT_SCRAPE_WORKERS
+        ) as executor:
+            futures = {
+                executor.submit(scraper.scrape, r["url"]): r for r in pages_to_scrape
+            }
+            for future in concurrent.futures.as_completed(futures):
+                original_result = futures[future]
+                try:
+                    page_data = future.result()
+                    scraped_pages.append(
+                        {
+                            "url": page_data["url"],
+                            "title": page_data["title"] or original_result.get("title", ""),
+                            "snippet": original_result.get("content", ""),
+                            "content": page_data["content"],
+                            "source": page_data["source"],
+                            "error": page_data["error"],
+                        }
                     )
-                return json.dumps(
-                    {"query": query, "results": [], "message": "No results found."}
+                except Exception as e:
+                    scraped_pages.append(
+                        {
+                            "url": original_result.get("url", ""),
+                            "title": original_result.get("title", ""),
+                            "snippet": original_result.get("content", ""),
+                            "content": "",
+                            "source": "failed",
+                            "error": str(e),
+                        }
+                    )
+
+        # Filter out pages with too little content
+        valid_pages = []
+        for page in scraped_pages:
+            if page["content"] and len(page["content"]) >= self.valves.MIN_CONTENT_LENGTH:
+                valid_pages.append(page)
+            elif page["snippet"]:
+                # Fall back to the search snippet if scrape failed
+                page["content"] = page["snippet"]
+                page["source"] = "snippet_only"
+                valid_pages.append(page)
+
+        # --- Step 4: Build additional results (not scraped, snippet only) ---
+        additional_results = []
+        for r in remaining_results:
+            additional_results.append(
+                {
+                    "url": r.get("url", ""),
+                    "title": r.get("title", ""),
+                    "snippet": r.get("content", ""),
+                }
+            )
+
+        # --- Step 5: Emit citations ---
+        if include_citations:
+            for page in valid_pages:
+                await emitter.citation(
+                    title=page["title"],
+                    url=page["url"],
+                    content=page["content"][:500],
                 )
 
-            # Emit citations for each result
-            for r in results:
-                await self._emit_source(__event_emitter__, r["url"], r["title"])
+        # --- Step 6: Format and return ---
+        output = {
+            "query": query,
+            "results_scraped": valid_pages,
+            "results_additional": additional_results,
+            "total_found": len(filtered_results),
+            "pages_scraped": len(valid_pages),
+        }
 
-            if show_status:
-                await self._emit_status(
-                    __event_emitter__,
-                    f"Found {len(results)} results.",
-                    done=True,
-                )
+        if show_status:
+            await emitter.done(
+                f"Search complete: {len(valid_pages)} pages scraped, {len(additional_results)} additional results"
+            )
 
-            return json.dumps({"query": query, "results": results}, ensure_ascii=False)
-
-        except requests.exceptions.ConnectionError:
-            error_msg = f"Could not connect to search engine at {self.valves.SEARCH_ENGINE_URL}. Check the URL in tool settings."
-            if show_status:
-                await self._emit_status(__event_emitter__, error_msg, done=True)
-            return json.dumps({"error": error_msg})
-        except requests.exceptions.Timeout:
-            error_msg = "Search request timed out."
-            if show_status:
-                await self._emit_status(__event_emitter__, error_msg, done=True)
-            return json.dumps({"error": error_msg})
-        except Exception as e:
-            error_msg = f"Search failed: {str(e)}"
-            if show_status:
-                await self._emit_status(__event_emitter__, error_msg, done=True)
-            return json.dumps({"error": error_msg})
+        return json.dumps(output, ensure_ascii=False)
 
     async def fetch_page(
         self,
         url: str,
         __event_emitter__: Callable[[dict], Any] = None,
-        __user__: dict = {},
+        __user__: Optional[dict] = None,
     ) -> str:
         """
-        Fetch and extract the text content of a webpage. Use this after searching when a
-        search snippet does not contain enough detail to fully answer the question. This is
-        especially useful for reading official documentation, configuration references, changelogs,
-        troubleshooting guides, README files, and technical articles. Only fetch URLs that were
-        returned by a previous search_web call. You may call this multiple times to read
-        several pages if needed.
+        Fetch and extract the full text content from a specific URL.
+        Use this tool when you need to read the complete content of a specific web page,
+        for example when a search result snippet looks promising but you need more detail,
+        or when the user provides a URL they want you to read.
 
-        :param url: The full URL of the page to fetch.
-        :return: The extracted text content of the page, truncated to the configured maximum length.
+        Handles regular web pages, pages blocked by captchas (via FlareSolverr fallback),
+        and PDF documents.
+
+        :param url: The complete URL of the page to fetch (must include https:// or http://).
+        :return: A JSON string containing the page title, extracted text content, and metadata.
         """
-        if not self.valves.FETCH_FULL_PAGE:
-            return json.dumps(
-                {"error": "Page fetching is disabled in tool settings."}
-            )
+        emitter = EventEmitter(__event_emitter__)
 
-        user_valves = __user__.get("valves")
-        if not user_valves:
-            user_valves = self.UserValves()
-        show_status = user_valves.SHOW_STATUS_UPDATES
+        show_status = True
+        include_citations = True
+        if __user__:
+            user_valves = __user__.get("valves")
+            if user_valves:
+                show_status = getattr(user_valves, "SHOW_STATUS_UPDATES", True)
+                include_citations = getattr(user_valves, "INCLUDE_CITATIONS", True)
 
         if show_status:
-            await self._emit_status(__event_emitter__, f"Fetching: {url}")
+            await emitter.emit(f"Fetching: {url}")
 
-        html = None
-        used_flaresolverr = False
+        scraper = PageScraper(self.valves)
 
-        # --- Attempt 1: Direct fetch ---
-        try:
-            html, status_code = self._fetch_direct(url)
+        loop = asyncio.get_event_loop()
+        page_data = await loop.run_in_executor(None, scraper.scrape, url)
 
-            # Detect soft blocks: 403, captcha pages, empty responses
-            is_blocked = False
-            if status_code == 403:
-                is_blocked = True
-            elif status_code == 503:
-                is_blocked = True
-            elif html and len(html) < 2000:
-                html_lower = html.lower()
-                block_signals = [
-                    "captcha",
-                    "cf-browser-verification",
-                    "challenge-platform",
-                    "just a moment",
-                    "checking your browser",
-                    "access denied",
-                    "please enable javascript",
-                    "ray id",
-                    "cloudflare",
-                    "bot detection",
-                    "are you a robot",
-                    "verify you are human",
-                ]
-                if any(signal in html_lower for signal in block_signals):
-                    is_blocked = True
-
-            if is_blocked:
-                raise requests.exceptions.HTTPError(
-                    f"Blocked (status {status_code})"
-                )
-
-        except Exception as direct_error:
-            # --- Attempt 2: FlareSolverr fallback ---
-            if (
-                self.valves.FLARESOLVERR_URL
-                and self.valves.RETRY_WITH_FLARESOLVERR
-            ):
-                if show_status:
-                    await self._emit_status(
-                        __event_emitter__,
-                        f"Direct fetch blocked, retrying with FlareSolverr...",
-                    )
-                try:
-                    html = self._fetch_via_flaresolverr(url)
-                    used_flaresolverr = True
-                except Exception as flare_error:
-                    error_msg = (
-                        f"Direct fetch failed: {str(direct_error)}. "
-                        f"FlareSolverr also failed: {str(flare_error)}"
-                    )
-                    if show_status:
-                        await self._emit_status(
-                            __event_emitter__, error_msg, done=True
-                        )
-                    return json.dumps({"error": error_msg})
-            else:
-                error_msg = f"Failed to fetch page: {str(direct_error)}"
-                if self.valves.FLARESOLVERR_URL == "":
-                    error_msg += " (FlareSolverr is not configured — set FLARESOLVERR_URL in tool settings to handle bot protection)"
-                if show_status:
-                    await self._emit_status(
-                        __event_emitter__, error_msg, done=True
-                    )
-                return json.dumps({"error": error_msg})
-
-        # --- Extract text from HTML ---
-        try:
-            text = self._extract_text(html)
-
-            if not text or len(text) < 50:
-                return json.dumps(
-                    {
-                        "url": url,
-                        "content": "",
-                        "message": "Page returned very little readable text. It may require JavaScript rendering or authentication.",
-                    }
-                )
-
-            # Truncate to max length
-            max_len = self.valves.MAX_CONTENT_LENGTH
-            if len(text) > max_len:
-                text = text[:max_len] + "\n\n[Content truncated — increase MAX_CONTENT_LENGTH in tool settings to see more]"
-
-            await self._emit_source(__event_emitter__, url, url)
-
-            method = "FlareSolverr" if used_flaresolverr else "direct"
-            if show_status:
-                await self._emit_status(
-                    __event_emitter__,
-                    f"Fetched {len(text)} chars ({method}).",
-                    done=True,
-                )
-
+        if page_data["error"] and not page_data["content"]:
+            await emitter.error(f"Failed to fetch page: {page_data['error']}")
             return json.dumps(
-                {"url": url, "content": text}, ensure_ascii=False
+                {"url": url, "error": page_data["error"], "content": ""},
+                ensure_ascii=False,
             )
 
-        except Exception as e:
-            error_msg = f"Failed to extract content: {str(e)}"
-            if show_status:
-                await self._emit_status(__event_emitter__, error_msg, done=True)
-            return json.dumps({"error": error_msg})
+        if include_citations and page_data["content"]:
+            await emitter.citation(
+                title=page_data["title"],
+                url=url,
+                content=page_data["content"][:500],
+            )
+
+        if show_status:
+            content_len = len(page_data["content"])
+            source_note = f" (via {page_data['source']})" if page_data["source"] != "direct" else ""
+            await emitter.done(f"Fetched {content_len} chars{source_note}")
+
+        return json.dumps(
+            {
+                "url": url,
+                "title": page_data["title"],
+                "content": page_data["content"],
+                "source": page_data["source"],
+                "error": page_data["error"],
+            },
+            ensure_ascii=False,
+        )

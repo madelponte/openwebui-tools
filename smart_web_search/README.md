@@ -1,26 +1,42 @@
-# Smart Web Search — Open WebUI Tool
+# Smart Web Search for Open WebUI
 
-A tool that gives your LLM the ability to search the web *on its own terms*. Instead of blindly searching your raw prompt (like the built-in web search toggle does), the model decides **when** it needs more information and **crafts its own search queries** to find exactly what it needs.
+An intelligent web search tool that gives your LLM the ability to autonomously decide when it needs external knowledge, formulate its own search queries, scrape full page content, and iterate until it has enough information to answer your question.
 
-## How It Works
+## The Problem
 
-When you attach this tool to a model, two functions become available to it:
+Open WebUI's built-in web search toggle searches using your exact prompt, which fails with complex or multi-part questions. The model has no control over what gets searched or when.
 
-**`search_web`** — The model writes a short, targeted query and gets back titles, URLs, and snippets from your search engine. It can call this multiple times with different queries to research a topic from several angles.
+## How This Tool is Different
 
-**`fetch_page`** — After searching, if a snippet isn't detailed enough, the model can read the full content of a result page. This is what lets it dig into documentation, changelogs, and troubleshooting guides — not just skim headlines.
+With native tool calling enabled, the model itself decides:
 
-The key difference from the built-in search toggle: the model tries to answer with its own knowledge first. If it needs to verify a fact, look up a config option, check current docs, or debug an error you've reported, it searches on its own. You don't need to tell it to search — it just does.
+- **Whether** it needs to search at all (it won't search if it already knows the answer)
+- **What** to search for (it formulates concise, targeted queries)
+- **When** to search again (if the first results aren't sufficient, it refines and retries)
+- **When** to deep-read a page (it can fetch the full content of any promising URL)
+
+This mirrors how a human would research — start with what you know, search when you hit a gap, read deeper when a source looks useful, and keep going until you have what you need.
+
+## Features
+
+- **SearXNG integration** — privacy-respecting meta-search via your self-hosted instance
+- **Full page scraping** — doesn't just return snippets; scrapes and extracts the actual page content
+- **FlareSolverr fallback** — automatically retries blocked/captcha pages through FlareSolverr
+- **PDF handling** — detects and extracts text from PDF documents encountered during search
+- **Concurrent scraping** — fetches multiple pages in parallel for speed
+- **Citations** — emits source citations into the Open WebUI chat interface
+- **Configurable via Valves** — tune every aspect from the admin UI without touching code
 
 ## Requirements
 
-- A search engine with a JSON API. **SearXNG** (self-hosted) or **Tavily** (cloud API) are supported.
-- Your model must support **native function/tool calling** (set Function Calling to "Native" in chat advanced params).
-- **Optional:** A FlareSolverr instance for bypassing Cloudflare and CAPTCHA protections when fetching pages.
+- Open WebUI (with native function calling support)
+- A model that supports tool calling (e.g. Qwen 3, Llama 3.3 70B+, GPT-4o, Claude, Gemini, etc.)
+- SearXNG instance with JSON format enabled
+- FlareSolverr instance (optional, for captcha bypass)
 
-### SearXNG Note
+### SearXNG JSON Format
 
-Your SearXNG instance must have JSON output enabled. In your `settings.yml`:
+Your SearXNG instance must have JSON output enabled. In your SearXNG `settings.yml`:
 
 ```yaml
 search:
@@ -29,68 +45,108 @@ search:
     - json
 ```
 
+Restart SearXNG after making this change.
+
 ## Installation
 
-1. Go to **Workspace → Tools** and click the **+** button.
-2. Paste the contents of `smart_web_search.py` into the editor.
-3. Give it a name (e.g. "Smart Web Search") and save.
-4. Go to **Workspace → Models**, select your model, click the edit icon.
-5. Scroll to the **Tools** section and check "Smart Web Search".
-6. In your chat, open **Advanced Params** and set **Function Calling** to **Native**.
+1. In Open WebUI, go to **Workspace → Tools**
+2. Click the **+** (plus) button to create a new tool
+3. Paste the entire contents of `smart_web_search.py` into the editor
+4. Click **Save**
 
-## Valve Reference
+## Configuration
 
-### Admin Valves
+After saving the tool, click the gear icon to configure the Valves:
 
-These are configured by the admin in the tool settings.
+### Required
 
 | Valve | Default | Description |
-|---|---|---|
-| `SEARCH_ENGINE_URL` | `http://searxng:8080/search` | The search API endpoint. For SearXNG, point to the `/search` path. For Tavily, use `https://api.tavily.com/search`. |
-| `SEARCH_ENGINE_TYPE` | `searxng` | Which search backend to use: `searxng` or `tavily`. |
-| `SEARCH_API_KEY` | *(empty)* | API key for the search engine. Required for Tavily. Optional for SearXNG unless you've enabled authentication. |
-| `MAX_SEARCH_RESULTS` | `5` | How many results to return per search query. More results give the model more to work with but use more context. |
-| `MAX_CONTENT_LENGTH` | `4000` | Maximum characters of page content returned by `fetch_page`. Increase if your model has a large context window and you want it to read more of each page. |
-| `FETCH_TIMEOUT` | `15` | Timeout in seconds for all HTTP requests (search and fetch). |
-| `SEARCH_CATEGORIES` | `general` | Comma-separated SearXNG categories (e.g. `general,it,science`). Only applies to SearXNG. |
-| `FETCH_FULL_PAGE` | `true` | Whether the `fetch_page` tool is available. Disable if you only want the model to use search snippets. |
-| `FLARESOLVERR_URL` | *(empty)* | FlareSolverr endpoint (e.g. `http://flaresolverr:8191/v1`). Leave empty to disable. When set, pages that fail to load directly are automatically retried through FlareSolverr. |
-| `RETRY_WITH_FLARESOLVERR` | `true` | Whether to automatically fall back to FlareSolverr when a direct fetch is blocked. Only relevant if `FLARESOLVERR_URL` is set. |
+|-------|---------|-------------|
+| `SEARXNG_BASE_URL` | `http://searxng:8080` | Base URL of your SearXNG instance |
 
-### User Valves
-
-These can be changed by individual users from the chat interface.
+### FlareSolverr (Optional)
 
 | Valve | Default | Description |
-|---|---|---|
-| `SHOW_STATUS_UPDATES` | `true` | Show "Searching…" and "Fetching…" status messages above the response while the tool is working. |
+|-------|---------|-------------|
+| `FLARESOLVERR_URL` | `http://flaresolverr:8191/v1` | FlareSolverr API endpoint. Clear this to disable. |
+| `FLARESOLVERR_TIMEOUT` | `60` | Timeout in seconds for FlareSolverr requests |
 
-## FlareSolverr Setup (Optional)
+### Search Behavior
 
-Some websites block automated requests with Cloudflare challenges or CAPTCHAs. FlareSolverr runs a headless browser that solves these automatically.
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `SEARCH_RESULTS_COUNT` | `5` | Number of results to fetch from SearXNG |
+| `PAGES_TO_SCRAPE` | `3` | How many top results to fully scrape |
+| `SEARCH_CATEGORIES` | `general` | SearXNG categories (comma-separated, e.g. `general,it,science`) |
+| `SEARCH_LANGUAGE` | `en` | Language code for results |
+| `SEARCH_TIME_RANGE` | *(empty)* | Filter by time: `day`, `week`, `month`, or `year` |
 
-The tool tries a direct fetch first (with realistic browser headers). If it detects a block — HTTP 403/503, Cloudflare challenge pages, CAPTCHA prompts — it retries through FlareSolverr. This means unprotected pages load fast, and protected pages still work.
+### Content Processing
 
-Add this to your `docker-compose.yml`:
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `MAX_PAGE_CONTENT_LENGTH` | `20000` | Max characters extracted per page (protects context window) |
+| `MIN_CONTENT_LENGTH` | `50` | Minimum chars for a page to count as valid |
 
-```yaml
-flaresolverr:
-  image: ghcr.io/flaresolverr/flaresolverr:latest
-  container_name: flaresolverr
-  environment:
-    - LOG_LEVEL=info
-    - LOG_HTML=false
-    - TZ=America/New_York
-  ports:
-    - "8191:8191"
-  restart: unless-stopped
-```
+### Network
 
-Then set the `FLARESOLVERR_URL` valve to `http://flaresolverr:8191/v1` (adjust the hostname to match your Docker network).
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `REQUEST_TIMEOUT` | `15` | Timeout in seconds for direct HTTP requests |
+| `USER_AGENT` | Chrome 120 string | User-Agent header sent with requests |
+| `CONCURRENT_SCRAPE_WORKERS` | `3` | Parallel page scrape threads |
+| `IGNORED_DOMAINS` | *(empty)* | Comma-separated domains to skip (e.g. `pinterest.com,facebook.com`) |
+
+### User Valves (per-user)
+
+Users can toggle these in the chat interface:
+
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `SHOW_STATUS_UPDATES` | `true` | Show progress messages during search |
+| `INCLUDE_CITATIONS` | `true` | Attach source citations to results |
+
+## Enabling the Tool
+
+### Per-model (recommended)
+
+1. Go to **Workspace → Models**
+2. Select your model and click the edit (pencil) icon
+3. Scroll to the **Tools** section
+4. Check **Smart Web Search**
+5. Click **Save**
+
+### Per-chat
+
+1. Open a chat
+2. Click the **+** icon in the input area
+3. Toggle **Smart Web Search** on
+
+### Function Calling Mode
+
+Go to **Advanced Params** in your chat and set **Function Calling** to **Native**. This is required for the model to autonomously decide when to use the tool.
+
+## How It Works in Practice
+
+**You ask:** "Help me set up Grafana Alloy with a Helm chart for collecting Kubernetes logs"
+
+**The model:**
+1. Writes an initial answer from its own knowledge
+2. If you come back with an error, the model recognizes it doesn't know the fix
+3. Calls `search_web("grafana alloy helm chart loki config")` autonomously
+4. Reads the scraped documentation pages
+5. Calls `fetch_page("https://grafana.com/docs/alloy/...")` for deeper reading
+6. Provides an updated answer with the correct configuration
+
+All of this happens automatically — you just have a normal conversation.
 
 ## Tips
 
-- **Search aggressiveness:** The tool is designed to search liberally — for verification, references, docs, version-specific details, and error debugging. If you find it searching too often or not often enough, the behavior is driven by the docstrings in the Python file. You can edit them to tune the model's judgment.
-- **Multiple searches:** The model can call `search_web` several times in a single response with different queries. This is useful for complex questions that need information from multiple sources.
-- **Context budget:** If your model has a smaller context window, lower `MAX_SEARCH_RESULTS` (e.g. 3) and `MAX_CONTENT_LENGTH` (e.g. 2000) to leave room for the model's own reasoning. For large-context models, you can increase both.
-- **SearXNG categories:** Setting `SEARCH_CATEGORIES` to `it` or `science` can improve result quality for technical questions, but `general` is a safe default.
+- **Smaller context = better results.** If you're using a model with a limited context window, lower `PAGES_TO_SCRAPE` and `MAX_PAGE_CONTENT_LENGTH` to avoid overwhelming it.
+- **Ignored domains** are useful for filtering out low-quality results (social media, aggregators, etc.).
+- **Time range filtering** is great for fast-moving topics where you only want recent results.
+- **FlareSolverr** is only needed if you frequently encounter sites with Cloudflare protection or similar. If you don't have it running, just clear the `FLARESOLVERR_URL` valve.
+
+## License
+
+MIT
