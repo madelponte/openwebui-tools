@@ -1,8 +1,8 @@
 """
 title: Smart Web Search
 description: An intelligent web search tool that lets the model decide when it needs external knowledge. Uses SearXNG for search, scrapes pages for full content, falls back to FlareSolverr for captcha-blocked pages, and handles PDFs. The model formulates its own search queries and iterates until it has enough information to answer.
-author: Claude
-version: 1.0.0
+author: mdelponte
+version: 1.1.0
 license: MIT
 requirements: beautifulsoup4, requests
 """
@@ -244,6 +244,53 @@ class PageScraper:
             logger.error(f"FlareSolverr request failed for {url}: {e}")
             return None
 
+    def _fetch_html(self, url: str) -> Dict[str, Any]:
+        """
+        Fetch raw HTML from a URL with FlareSolverr fallback.
+        Returns dict with keys: html, source, error, response, is_pdf, pdf_bytes
+        """
+        result = {"html": None, "source": "direct", "error": None, "response": None, "is_pdf": False, "pdf_bytes": None}
+        try:
+            resp = self.session.get(url, timeout=self.valves.REQUEST_TIMEOUT, allow_redirects=True)
+            result["response"] = resp
+
+            # Handle PDFs
+            if self._is_pdf_url(url, resp):
+                result["is_pdf"] = True
+                result["pdf_bytes"] = resp.content
+                return result
+
+            # Check if blocked / captcha
+            if self._looks_blocked(resp):
+                logger.info(f"Page appears blocked, trying FlareSolverr: {url}")
+                html = self._fetch_via_flaresolverr(url)
+                if html:
+                    result["html"] = html
+                    result["source"] = "flaresolverr"
+                else:
+                    result["error"] = "Page blocked by captcha/anti-bot and FlareSolverr unavailable or failed"
+                    result["html"] = resp.text
+            else:
+                resp.raise_for_status()
+                result["html"] = resp.text
+
+        except requests.exceptions.Timeout:
+            result["error"] = f"Request timed out after {self.valves.REQUEST_TIMEOUT}s"
+        except requests.exceptions.ConnectionError:
+            result["error"] = "Connection failed"
+        except requests.exceptions.HTTPError as e:
+            logger.info(f"HTTP error {e}, trying FlareSolverr: {url}")
+            html = self._fetch_via_flaresolverr(url)
+            if html:
+                result["html"] = html
+                result["source"] = "flaresolverr"
+            else:
+                result["error"] = f"HTTP {e.response.status_code if e.response else 'unknown'}"
+        except Exception as e:
+            result["error"] = str(e)
+
+        return result
+
     def scrape(self, url: str) -> Dict[str, Any]:
         """
         Scrape a URL and return extracted content.
@@ -255,53 +302,243 @@ class PageScraper:
             url = "https://" + url
             result["url"] = url
 
-        try:
-            resp = self.session.get(url, timeout=self.valves.REQUEST_TIMEOUT, allow_redirects=True)
+        fetch = self._fetch_html(url)
+        result["source"] = fetch["source"]
+        result["error"] = fetch["error"]
 
-            # Handle PDFs
-            if self._is_pdf_url(url, resp):
-                result["title"] = url.split("/")[-1]
-                result["content"] = self._extract_pdf_text(resp.content)
-                result["source"] = "pdf"
-                return result
+        if fetch["is_pdf"]:
+            result["title"] = url.split("/")[-1]
+            result["content"] = self._extract_pdf_text(fetch["pdf_bytes"])
+            result["source"] = "pdf"
+            return result
 
-            # Check if blocked / captcha
-            if self._looks_blocked(resp):
-                logger.info(f"Page appears blocked, trying FlareSolverr: {url}")
-                html = self._fetch_via_flaresolverr(url)
-                if html:
-                    result["source"] = "flaresolverr"
-                else:
-                    result["error"] = "Page blocked by captcha/anti-bot and FlareSolverr unavailable or failed"
-                    # Still try to extract whatever we got
-                    html = resp.text
-            else:
-                resp.raise_for_status()
-                html = resp.text
-
-            soup = BeautifulSoup(html, "html.parser")
+        if fetch["html"]:
+            soup = BeautifulSoup(fetch["html"], "html.parser")
             title_tag = soup.find("title")
             result["title"] = title_tag.get_text(strip=True) if title_tag else parsed.netloc
-            result["content"] = self._extract_text_from_html(html, url)
+            result["content"] = self._extract_text_from_html(fetch["html"], url)
 
-        except requests.exceptions.Timeout:
-            result["error"] = f"Request timed out after {self.valves.REQUEST_TIMEOUT}s"
-        except requests.exceptions.ConnectionError:
-            result["error"] = "Connection failed"
-        except requests.exceptions.HTTPError as e:
-            # Try FlareSolverr as fallback for HTTP errors
-            logger.info(f"HTTP error {e}, trying FlareSolverr: {url}")
-            html = self._fetch_via_flaresolverr(url)
-            if html:
-                soup = BeautifulSoup(html, "html.parser")
-                title_tag = soup.find("title")
-                result["title"] = title_tag.get_text(strip=True) if title_tag else parsed.netloc
-                result["content"] = self._extract_text_from_html(html, url)
-                result["source"] = "flaresolverr"
-            else:
-                result["error"] = f"HTTP {e.response.status_code if e.response else 'unknown'}"
-        except Exception as e:
-            result["error"] = str(e)
+        return result
+
+    def extract_structure(self, url: str) -> Dict[str, Any]:
+        """
+        Fetch a URL and extract structured elements: headings, links, tables, sections, 
+        meta info, code blocks, and lists.
+        """
+        result = {
+            "url": url,
+            "title": "",
+            "meta": {},
+            "headings": [],
+            "links": [],
+            "tables": [],
+            "sections": [],
+            "code_blocks": [],
+            "lists": [],
+            "source": "direct",
+            "error": None,
+        }
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            url = "https://" + url
+            result["url"] = url
+
+        fetch = self._fetch_html(url)
+        result["source"] = fetch["source"]
+        result["error"] = fetch["error"]
+
+        if fetch["is_pdf"]:
+            result["title"] = url.split("/")[-1]
+            result["error"] = "Structured extraction is not supported for PDFs. Use fetch_page for PDF content."
+            return result
+
+        if not fetch["html"]:
+            return result
+
+        soup = BeautifulSoup(fetch["html"], "html.parser")
+
+        # Remove noise
+        for tag in soup.find_all(["script", "style", "noscript"]):
+            tag.decompose()
+
+        # --- Title ---
+        title_tag = soup.find("title")
+        result["title"] = title_tag.get_text(strip=True) if title_tag else parsed.netloc
+
+        # --- Meta tags ---
+        meta = {}
+        desc_tag = soup.find("meta", attrs={"name": "description"})
+        if desc_tag and desc_tag.get("content"):
+            meta["description"] = desc_tag["content"]
+        keywords_tag = soup.find("meta", attrs={"name": "keywords"})
+        if keywords_tag and keywords_tag.get("content"):
+            meta["keywords"] = keywords_tag["content"]
+        og_title = soup.find("meta", attrs={"property": "og:title"})
+        if og_title and og_title.get("content"):
+            meta["og_title"] = og_title["content"]
+        og_desc = soup.find("meta", attrs={"property": "og:description"})
+        if og_desc and og_desc.get("content"):
+            meta["og_description"] = og_desc["content"]
+        canonical = soup.find("link", attrs={"rel": "canonical"})
+        if canonical and canonical.get("href"):
+            meta["canonical_url"] = canonical["href"]
+        result["meta"] = meta
+
+        # --- Headings (h1-h6 with hierarchy) ---
+        headings = []
+        for tag in soup.find_all(re.compile(r"^h[1-6]$")):
+            text = tag.get_text(strip=True)
+            if text:
+                level = int(tag.name[1])
+                heading_id = tag.get("id", "")
+                headings.append({"level": level, "text": text, "id": heading_id})
+        result["headings"] = headings
+
+        # --- Links (deduplicated, with context) ---
+        links = []
+        seen_hrefs = set()
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            # Resolve relative URLs
+            absolute = urljoin(url, href)
+            if absolute in seen_hrefs:
+                continue
+            # Skip anchors, javascript, mailto
+            if href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            seen_hrefs.add(absolute)
+            link_text = a_tag.get_text(strip=True)
+            links.append({"url": absolute, "text": link_text or "[no text]"})
+        result["links"] = links[:200]  # Cap to avoid massive lists
+
+        # --- Tables (converted to list-of-dicts where possible) ---
+        tables = []
+        for table_idx, table_tag in enumerate(soup.find_all("table")):
+            table_data = {"index": table_idx, "headers": [], "rows": [], "caption": ""}
+
+            # Caption
+            caption = table_tag.find("caption")
+            if caption:
+                table_data["caption"] = caption.get_text(strip=True)
+
+            # Extract headers
+            headers = []
+            thead = table_tag.find("thead")
+            header_row = thead.find("tr") if thead else table_tag.find("tr")
+            if header_row:
+                for th in header_row.find_all(["th"]):
+                    headers.append(th.get_text(strip=True))
+            # If no <th> found, check if first row looks like headers
+            if not headers and header_row:
+                first_cells = header_row.find_all(["td", "th"])
+                if first_cells:
+                    headers = [c.get_text(strip=True) for c in first_cells]
+            table_data["headers"] = headers
+
+            # Extract body rows
+            rows = []
+            body = table_tag.find("tbody") or table_tag
+            for tr in body.find_all("tr"):
+                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if cells and cells != headers:  # Skip header row if duplicated
+                    if headers and len(cells) == len(headers):
+                        rows.append(dict(zip(headers, cells)))
+                    else:
+                        rows.append(cells)
+            table_data["rows"] = rows[:100]  # Cap rows
+            if rows or headers:
+                tables.append(table_data)
+        result["tables"] = tables[:20]  # Cap tables
+
+        # --- Sections (content grouped by headings) ---
+        sections = []
+        main_area = (
+            soup.find("main")
+            or soup.find("article")
+            or soup.find("div", {"role": "main"})
+            or soup.body
+            or soup
+        )
+        current_section = {"heading": "", "heading_level": 0, "content": ""}
+        if main_area:
+            for element in main_area.find_all(True, recursive=True):
+                if element.name and re.match(r"^h[1-6]$", element.name):
+                    # Save previous section
+                    if current_section["content"].strip():
+                        current_section["content"] = current_section["content"].strip()
+                        sections.append(current_section)
+                    current_section = {
+                        "heading": element.get_text(strip=True),
+                        "heading_level": int(element.name[1]),
+                        "content": "",
+                    }
+                elif element.name in ("p", "li", "dd", "blockquote", "figcaption"):
+                    text = element.get_text(strip=True)
+                    if text and len(text) > 5:
+                        current_section["content"] += text + "\n"
+            # Don't forget the last section
+            if current_section["content"].strip():
+                current_section["content"] = current_section["content"].strip()
+                sections.append(current_section)
+
+        # Truncate section content
+        max_section_chars = self.valves.MAX_PAGE_CONTENT_LENGTH // max(len(sections), 1)
+        for section in sections:
+            if len(section["content"]) > max_section_chars:
+                section["content"] = section["content"][:max_section_chars] + "..."
+        result["sections"] = sections
+
+        # --- Code blocks ---
+        code_blocks = []
+        for code_tag in soup.find_all(["code", "pre"]):
+            text = code_tag.get_text(strip=True)
+            if text and len(text) > 10:
+                # Detect language from class
+                classes = code_tag.get("class", [])
+                lang = ""
+                for cls in classes:
+                    if cls.startswith(("language-", "lang-", "highlight-")):
+                        lang = cls.split("-", 1)[1]
+                        break
+                # Check parent if this is <code> inside <pre>
+                if not lang and code_tag.parent and code_tag.parent.name == "pre":
+                    parent_classes = code_tag.parent.get("class", [])
+                    for cls in parent_classes:
+                        if cls.startswith(("language-", "lang-", "highlight-")):
+                            lang = cls.split("-", 1)[1]
+                            break
+                code_blocks.append({
+                    "language": lang,
+                    "content": text[:5000],  # Cap per block
+                })
+        # Deduplicate (nested <code> inside <pre> can double up)
+        seen_code = set()
+        deduped_code = []
+        for block in code_blocks:
+            key = block["content"][:200]
+            if key not in seen_code:
+                seen_code.add(key)
+                deduped_code.append(block)
+        result["code_blocks"] = deduped_code[:30]  # Cap total
+
+        # --- Lists (ol/ul with items) ---
+        lists = []
+        for list_tag in soup.find_all(["ul", "ol"]):
+            # Skip nav/menu lists
+            parent = list_tag.parent
+            if parent and parent.name in ("nav", "header", "footer"):
+                continue
+            items = []
+            for li in list_tag.find_all("li", recursive=False):
+                text = li.get_text(strip=True)
+                if text:
+                    items.append(text[:500])
+            if items and len(items) >= 2:  # Skip single-item lists
+                lists.append({
+                    "type": "ordered" if list_tag.name == "ol" else "unordered",
+                    "items": items[:50],
+                })
+        result["lists"] = lists[:20]  # Cap total
 
         return result
 
@@ -416,7 +653,7 @@ class Tools:
         __user__: Optional[dict] = None,
     ) -> str:
         """
-        Search the web and return the search results with scraped page content.
+        Search the web using SearXNG and return the search results with scraped page content.
         Use this tool when you need current or up-to-date information that you don't have,
         when you're unsure about specific facts, versions, configurations, or documentation,
         or when the user's question involves recent events, products, or rapidly changing information.
@@ -639,3 +876,105 @@ class Tools:
             },
             ensure_ascii=False,
         )
+
+    async def extract_page_structure(
+        self,
+        url: str,
+        components: str = "all",
+        __event_emitter__: Callable[[dict], Any] = None,
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Fetch a web page and return its content as structured components instead of raw text.
+        Use this tool instead of fetch_page when you need specific structural elements from a
+        page, such as:
+        - The heading outline / table of contents
+        - All links on the page (e.g. to find documentation sub-pages or download URLs)
+        - Tables with their data preserved in rows and columns
+        - Code blocks with language detection
+        - Ordered and unordered lists
+        - Content organized by section (grouped under each heading)
+        - Page metadata (description, keywords, canonical URL)
+
+        This is especially useful for documentation pages, reference tables, API docs, changelogs,
+        comparison pages, or any page where you need to locate and extract a specific piece of
+        structured information rather than reading the entire page.
+
+        :param url: The complete URL of the page to extract structure from (must include https:// or http://).
+        :param components: Comma-separated list of components to extract. Options: headings, links, tables, sections, code_blocks, lists, meta. Use "all" to extract everything. Example: "tables,code_blocks" to only get tables and code blocks.
+        :return: A JSON string containing the requested structured components from the page.
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        show_status = True
+        include_citations = True
+        if __user__:
+            user_valves = __user__.get("valves")
+            if user_valves:
+                show_status = getattr(user_valves, "SHOW_STATUS_UPDATES", True)
+                include_citations = getattr(user_valves, "INCLUDE_CITATIONS", True)
+
+        if show_status:
+            await emitter.emit(f"Extracting structure from: {url}")
+
+        scraper = PageScraper(self.valves)
+
+        loop = asyncio.get_event_loop()
+        structure = await loop.run_in_executor(None, scraper.extract_structure, url)
+
+        if structure["error"] and not any(
+            structure.get(k) for k in ("headings", "links", "tables", "sections", "code_blocks", "lists")
+        ):
+            await emitter.error(f"Failed to extract structure: {structure['error']}")
+            return json.dumps(
+                {"url": url, "error": structure["error"]},
+                ensure_ascii=False,
+            )
+
+        # Filter to requested components
+        all_components = {"headings", "links", "tables", "sections", "code_blocks", "lists", "meta"}
+        if components.strip().lower() == "all":
+            requested = all_components
+        else:
+            requested = {c.strip().lower() for c in components.split(",") if c.strip()}
+            # Validate
+            invalid = requested - all_components
+            if invalid:
+                requested = requested & all_components  # Use only valid ones
+
+        output = {
+            "url": structure["url"],
+            "title": structure["title"],
+            "source": structure["source"],
+            "error": structure["error"],
+        }
+        for comp in all_components:
+            if comp in requested:
+                output[comp] = structure.get(comp, [])
+
+        # Add summary counts so the model can quickly assess what's available
+        output["summary"] = {}
+        for comp in requested:
+            data = structure.get(comp, [])
+            if isinstance(data, list):
+                output["summary"][comp] = len(data)
+            elif isinstance(data, dict):
+                output["summary"][comp] = len(data) if data else 0
+
+        if include_citations:
+            # Build a brief content summary for the citation
+            heading_preview = ", ".join(
+                h["text"] for h in structure.get("headings", [])[:5]
+            )
+            await emitter.citation(
+                title=structure["title"],
+                url=url,
+                content=f"Page structure: {heading_preview}" if heading_preview else structure["title"],
+            )
+
+        if show_status:
+            parts = [f"{output['summary'].get(k, 0)} {k}" for k in requested if output["summary"].get(k, 0) > 0]
+            summary_text = ", ".join(parts) if parts else "no structured content found"
+            await emitter.done(f"Extracted: {summary_text}")
+
+        return json.dumps(output, ensure_ascii=False)
