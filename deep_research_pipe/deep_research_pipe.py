@@ -289,6 +289,16 @@ class Pipe:
     async def _fetch_page(
         self, session: aiohttp.ClientSession, url: str
     ) -> Tuple[str, str]:
+        # Reddit links are typically served behind anti-bot measures that
+        # break plain HTML scraping. Route them through Reddit's public
+        # JSON endpoint instead (just append .json to the URL).
+        if self._is_reddit_url(url):
+            text = await self._fetch_reddit(session, url)
+            words = text.split()
+            if len(words) > self.valves.SNIPPET_MAX_WORDS:
+                text = " ".join(words[: self.valves.SNIPPET_MAX_WORDS]) + " [...]"
+            return url, text
+
         text = ""
         try:
             async with session.get(
@@ -324,6 +334,193 @@ class Pipe:
         if len(words) > self.valves.SNIPPET_MAX_WORDS:
             text = " ".join(words[: self.valves.SNIPPET_MAX_WORDS]) + " [...]"
         return url, text
+
+    # -----------------------------------------------------------------------
+    # Reddit JSON endpoint handling
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _is_reddit_url(url: str) -> bool:
+        """Detect reddit.com URLs (including subdomains like old./www./np.)."""
+        try:
+            lower = url.lower()
+            # Match http(s)://...reddit.com/ — catches www, old, np, i, etc.
+            return bool(
+                re.match(r"^https?://([a-z0-9-]+\.)?reddit\.com(/|$)", lower)
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _reddit_json_url(url: str) -> str:
+        """Convert a Reddit URL into its .json equivalent.
+
+        - Strips query string and fragment (Reddit's JSON endpoint ignores
+          most query params and some actively break it).
+        - Removes a trailing slash.
+        - Appends .json if not already present.
+        """
+        # Drop fragment
+        u = url.split("#", 1)[0]
+        # Drop query string
+        u = u.split("?", 1)[0]
+        # Drop trailing slash
+        if u.endswith("/"):
+            u = u[:-1]
+        if not u.endswith(".json"):
+            u = u + ".json"
+        return u
+
+    async def _fetch_reddit(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> str:
+        """Fetch a Reddit post/comments/listing via the public .json endpoint
+        and render it into plain text suitable for the research pipeline."""
+        json_url = self._reddit_json_url(url)
+        try:
+            async with session.get(
+                json_url,
+                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
+                headers={
+                    # A descriptive, non-browser UA works best with Reddit's
+                    # JSON endpoint — browser UAs are more likely to get
+                    # rate-limited / blocked.
+                    "User-Agent": (
+                        "deep-research-pipe/1.2 "
+                        "(+https://github.com/open-webui)"
+                    ),
+                    "Accept": "application/json",
+                },
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                if resp.status != 200:
+                    log.debug(
+                        f"Reddit JSON fetch returned {resp.status} for {json_url}"
+                    )
+                    return ""
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception as e:
+                    log.debug(f"Reddit JSON parse failed for {json_url}: {e}")
+                    return ""
+        except Exception as e:
+            log.debug(f"Reddit JSON fetch failed for {json_url}: {e}")
+            return ""
+
+        return self._render_reddit_json(data)
+
+    @staticmethod
+    def _render_reddit_json(data: Any) -> str:
+        """Render Reddit's JSON response into readable plain text.
+
+        Handles both the single-post format (list of two Listings: post +
+        comments) and the subreddit/listing format (one Listing of posts).
+        """
+        def _strip_html(s: str) -> str:
+            if not s:
+                return ""
+            s = re.sub(r"<[^>]+>", " ", s)
+            for ent, ch in [
+                ("&amp;", "&"),
+                ("&lt;", "<"),
+                ("&gt;", ">"),
+                ("&quot;", '"'),
+                ("&#39;", "'"),
+                ("&nbsp;", " "),
+            ]:
+                s = s.replace(ent, ch)
+            return re.sub(r"\s+", " ", s).strip()
+
+        def _walk_comments(children: List[Dict], depth: int = 0) -> List[str]:
+            out: List[str] = []
+            for child in children:
+                kind = child.get("kind")
+                cdata = child.get("data", {}) or {}
+                if kind != "t1":
+                    # Skip "more" stubs and anything non-comment
+                    continue
+                body = (cdata.get("body") or "").strip()
+                if not body or body in ("[deleted]", "[removed]"):
+                    continue
+                author = cdata.get("author") or "unknown"
+                score = cdata.get("score")
+                score_str = f" ({score} pts)" if score is not None else ""
+                indent = "  " * min(depth, 4)
+                out.append(f"{indent}- {author}{score_str}: {body}")
+                # Recurse into replies
+                replies = cdata.get("replies")
+                if isinstance(replies, dict):
+                    reply_children = (
+                        replies.get("data", {}).get("children", []) or []
+                    )
+                    out.extend(_walk_comments(reply_children, depth + 1))
+            return out
+
+        parts: List[str] = []
+
+        # Single post + comments: [post_listing, comments_listing]
+        if isinstance(data, list) and len(data) >= 1:
+            post_listing = data[0]
+            post_children = (
+                post_listing.get("data", {}).get("children", []) or []
+            )
+            if post_children:
+                post = post_children[0].get("data", {}) or {}
+                title = (post.get("title") or "").strip()
+                author = post.get("author") or "unknown"
+                subreddit = post.get("subreddit") or ""
+                score = post.get("score")
+                selftext = _strip_html(post.get("selftext") or "")
+                link_url = post.get("url") or ""
+
+                if title:
+                    parts.append(f"Title: {title}")
+                if subreddit:
+                    parts.append(f"Subreddit: r/{subreddit}")
+                parts.append(f"Author: u/{author}")
+                if score is not None:
+                    parts.append(f"Score: {score}")
+                if selftext:
+                    parts.append(f"\nPost body:\n{selftext}")
+                elif link_url and link_url not in (
+                    post.get("permalink", ""),
+                    "",
+                ):
+                    parts.append(f"Linked URL: {link_url}")
+
+            # Comments
+            if len(data) >= 2:
+                comment_listing = data[1]
+                comment_children = (
+                    comment_listing.get("data", {}).get("children", []) or []
+                )
+                rendered = _walk_comments(comment_children)
+                if rendered:
+                    parts.append("\nTop comments:")
+                    parts.extend(rendered)
+
+        # Listing of posts (e.g. /r/subreddit.json, /r/subreddit/top.json)
+        elif isinstance(data, dict) and data.get("kind") == "Listing":
+            children = data.get("data", {}).get("children", []) or []
+            for child in children:
+                cdata = child.get("data", {}) or {}
+                title = (cdata.get("title") or "").strip()
+                if not title:
+                    continue
+                author = cdata.get("author") or "unknown"
+                subreddit = cdata.get("subreddit") or ""
+                score = cdata.get("score")
+                selftext = _strip_html(cdata.get("selftext") or "")
+                header = f"- [{score} pts] r/{subreddit} — {title} (by u/{author})"
+                parts.append(header)
+                if selftext:
+                    # Keep listing entries compact
+                    snippet = selftext[:400]
+                    if len(selftext) > 400:
+                        snippet += "…"
+                    parts.append(f"  {snippet}")
+
+        return "\n".join(parts).strip()
 
     async def _flaresolverr(self, session: aiohttp.ClientSession, url: str) -> str:
         try:

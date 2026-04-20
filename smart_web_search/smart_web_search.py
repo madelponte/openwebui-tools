@@ -92,6 +92,27 @@ class PageScraper:
         "blocked",
         "security check",
         "ddos protection",
+        "please wait for verification",
+        "verify you are human",
+        "verifying you are human",
+        "verify you're human",
+        "verifying you're human",
+        "are you a robot",
+        "enable javascript and cookies to continue",
+    ]
+
+    # Title-based indicators — block pages almost always announce themselves in <title>
+    BLOCK_TITLE_INDICATORS = [
+        "please wait",
+        "just a moment",
+        "attention required",
+        "access denied",
+        "verification",
+        "verify you",
+        "checking your browser",
+        "security check",
+        "are you human",
+        "cloudflare",
     ]
 
     def __init__(self, valves):
@@ -109,11 +130,28 @@ class PageScraper:
         """Heuristic check for captcha / anti-bot pages."""
         if response.status_code in (403, 429, 503):
             return True
+
         body_lower = response.text[:5000].lower()
         hits = sum(1 for indicator in self.CAPTCHA_INDICATORS if indicator in body_lower)
-        # If the page is very short AND has indicators, it's likely a block page
+
+        # Check the <title> tag — block pages reliably put the reason there,
+        # and this catches cases like Reddit returning 200 with a full-sized
+        # HTML skeleton but a "Please wait for verification" title.
+        title_match = re.search(
+            r"<title[^>]*>(.*?)</title>",
+            response.text[:5000],
+            re.IGNORECASE | re.DOTALL,
+        )
+        if title_match:
+            title_lower = title_match.group(1).strip().lower()
+            for indicator in self.BLOCK_TITLE_INDICATORS:
+                if indicator in title_lower:
+                    return True
+
+        # Two or more body indicators → almost certainly a block page
         if hits >= 2:
             return True
+        # Short page with any indicator → also a block page
         if response.status_code == 200 and len(response.text) < 2000 and hits >= 1:
             return True
         return False
@@ -215,6 +253,141 @@ class PageScraper:
 
         return text
 
+    def _looks_like_block_html(self, html: str) -> bool:
+        """
+        Detect a block/challenge page given raw HTML (no requests.Response).
+        Used to validate FlareSolverr output — it can return a challenge page
+        as if it were the real content if it fails to solve the challenge.
+        """
+        if not html:
+            return False
+        snippet = html[:5000].lower()
+
+        # Title-based check — the strongest signal
+        title_match = re.search(
+            r"<title[^>]*>(.*?)</title>",
+            html[:5000],
+            re.IGNORECASE | re.DOTALL,
+        )
+        if title_match:
+            title_lower = title_match.group(1).strip().lower()
+            for indicator in self.BLOCK_TITLE_INDICATORS:
+                if indicator in title_lower:
+                    return True
+            # Reddit's post-challenge page title
+            if "prove your humanity" in title_lower:
+                return True
+
+        # Body phrase check
+        extra_phrases = [
+            "prove your humanity",
+            "complete the challenge below",
+            "let us know you're\na real person",
+            "let us know you are a real person",
+        ]
+        hits = sum(1 for ind in self.CAPTCHA_INDICATORS if ind in snippet)
+        hits += sum(1 for p in extra_phrases if p in snippet)
+        return hits >= 2
+
+    def _fetch_reddit_json(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Reddit's public .json endpoint returns post + comment data as structured JSON
+        and is far more reliable than scraping the HTML, which is gated behind
+        anti-bot challenges. Returns a dict with 'title' and 'text', or None on failure.
+        """
+        try:
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").lower()
+            if "reddit.com" not in host:
+                return None
+
+            # Strip trailing slash and any existing query string, then append .json
+            path = parsed.path.rstrip("/")
+            json_url = f"https://www.reddit.com{path}.json"
+
+            # Reddit blocks the default requests UA. A distinctive UA helps.
+            headers = {
+                "User-Agent": "smart-web-search/1.1 (+open-webui tool)",
+                "Accept": "application/json",
+            }
+            resp = requests.get(json_url, headers=headers, timeout=self.valves.REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                logger.info(f"Reddit JSON endpoint returned {resp.status_code} for {json_url}")
+                return None
+
+            data = resp.json()
+            if not isinstance(data, list) or len(data) < 1:
+                return None
+
+            # data[0] = the post listing (one child), data[1] = comments listing (if present)
+            parts = []
+            title = ""
+
+            post_children = data[0].get("data", {}).get("children", [])
+            if post_children:
+                post = post_children[0].get("data", {})
+                title = post.get("title", "") or ""
+                author = post.get("author", "")
+                subreddit = post.get("subreddit_name_prefixed", "")
+                selftext = post.get("selftext", "") or ""
+                post_url = post.get("url", "")
+                header_bits = []
+                if subreddit:
+                    header_bits.append(subreddit)
+                if author:
+                    header_bits.append(f"Posted by u/{author}")
+                if header_bits:
+                    parts.append(" · ".join(header_bits))
+                if title:
+                    parts.append(title)
+                if selftext.strip():
+                    parts.append(selftext.strip())
+                elif post_url and post_url != url:
+                    parts.append(f"[Link post] {post_url}")
+
+            # Comments
+            if len(data) >= 2:
+                comments_children = data[1].get("data", {}).get("children", [])
+                comment_texts = []
+
+                def walk(children, depth=0):
+                    for child in children:
+                        if child.get("kind") != "t1":
+                            continue
+                        cdata = child.get("data", {})
+                        body = cdata.get("body", "") or ""
+                        author = cdata.get("author", "")
+                        score = cdata.get("score", 0)
+                        if not body.strip() or body.strip() == "[deleted]" or body.strip() == "[removed]":
+                            pass
+                        else:
+                            prefix = "  " * depth
+                            comment_texts.append(
+                                f"{prefix}u/{author} ({score} points): {body.strip()}"
+                            )
+                        replies = cdata.get("replies")
+                        if isinstance(replies, dict):
+                            walk(replies.get("data", {}).get("children", []), depth + 1)
+
+                walk(comments_children)
+                if comment_texts:
+                    parts.append("--- Comments ---")
+                    parts.extend(comment_texts)
+
+            text = "\n\n".join(parts).strip()
+            if not text:
+                return None
+
+            # Respect the same truncation limit as HTML scraping
+            max_chars = self.valves.MAX_PAGE_CONTENT_LENGTH
+            if len(text) > max_chars:
+                text = text[:max_chars] + f"\n\n[Content truncated at {max_chars} characters]"
+
+            return {"title": title or "Reddit post", "text": text}
+        except Exception as e:
+            logger.warning(f"Reddit JSON fetch failed for {url}: {e}")
+            return None
+
     def _fetch_via_flaresolverr(self, url: str) -> Optional[str]:
         """Attempt to fetch a page through FlareSolverr to bypass captchas."""
         if not self.valves.FLARESOLVERR_URL:
@@ -236,7 +409,15 @@ class PageScraper:
 
             if data.get("status") == "ok":
                 solution = data.get("solution", {})
-                return solution.get("response", "")
+                html = solution.get("response", "")
+                # Post-check: FlareSolverr can return a challenge page if it couldn't
+                # solve the check (common for Reddit's "Prove your humanity" flow).
+                if html and self._looks_like_block_html(html):
+                    logger.warning(
+                        f"FlareSolverr returned an unsolved challenge page for {url}"
+                    )
+                    return None
+                return html
             else:
                 logger.warning(f"FlareSolverr returned status: {data.get('status')}")
                 return None
@@ -301,6 +482,20 @@ class PageScraper:
         if not parsed.scheme:
             url = "https://" + url
             result["url"] = url
+            parsed = urlparse(url)
+
+        # Reddit URLs: try the .json endpoint first. Reddit's HTML is gated behind
+        # anti-bot challenges that FlareSolverr frequently can't solve, but the
+        # public JSON endpoint returns post + comments reliably.
+        host = (parsed.netloc or "").lower()
+        if "reddit.com" in host and "/comments/" in parsed.path:
+            reddit_data = self._fetch_reddit_json(url)
+            if reddit_data:
+                result["title"] = reddit_data["title"]
+                result["content"] = reddit_data["text"]
+                result["source"] = "reddit_json"
+                return result
+            # else: fall through to normal HTML + FlareSolverr path
 
         fetch = self._fetch_html(url)
         result["source"] = fetch["source"]
