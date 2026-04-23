@@ -1,7 +1,7 @@
 """
 title: Deep Research
 author: mdelponte
-version: 1.2.0
+version: 1.2.1
 license: MIT
 description: >
     A deep research pipe that takes a user query, generates a research plan
@@ -9,7 +9,7 @@ description: >
     searches the web via SearXNG, fetches and extracts page content, and
     synthesizes a final structured report.  Supports FlareSolverr for
     bypassing captchas.
-required_open_webui_version: 0.5.0
+required_open_webui_version: 0.9.0
 """
 
 import asyncio
@@ -1067,7 +1067,7 @@ GUIDELINES:
             try:
                 user_obj = None
                 if __user__:
-                    user_obj = Users.get_user_by_id(__user__["id"])
+                    user_obj = await Users.get_user_by_id(__user__["id"])
                 payload = {
                     "model": task_model,
                     "messages": task_messages,
@@ -1130,7 +1130,7 @@ GUIDELINES:
 
         user_obj = None
         if __user__:
-            user_obj = Users.get_user_by_id(__user__["id"])
+            user_obj = await Users.get_user_by_id(__user__["id"])
 
         try:
             async with aiohttp.ClientSession() as session:
