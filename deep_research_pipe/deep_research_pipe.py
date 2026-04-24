@@ -1,7 +1,7 @@
 """
 title: Deep Research
 author: mdelponte
-version: 1.2.1
+version: 1.2.2
 license: MIT
 description: >
     A deep research pipe that takes a user query, generates a research plan
@@ -1243,13 +1243,13 @@ GUIDELINES:
                         "Unable to gather sufficient research data. "
                         "Check SearXNG availability or refine the query."
                     )
-                    await self._emit_replace(__event_emitter__, msg)
+                    await self._emit_replace(__event_emitter__, "")
                     await self._emit_status(
                         __event_emitter__,
                         "⚠️ No data collected",
                         done=True,
                     )
-                    return "⚠️ No data collected"
+                    return msg + _DONE_MARKER
 
                 # Update progress
                 await self._emit_replace(
@@ -1281,7 +1281,9 @@ GUIDELINES:
                 # Append the done-marker so the re-entry guard works
                 report_with_marker = report + _DONE_MARKER
 
-                await self._emit_replace(__event_emitter__, report_with_marker)
+                # Clear any "in-progress" content from the message body so
+                # the returned report doesn't get appended after it.
+                await self._emit_replace(__event_emitter__, "")
 
                 # Citations
                 for s in collected:
@@ -1300,11 +1302,11 @@ GUIDELINES:
                     done=True,
                 )
 
-                # Return empty — report is already in the message
-                # body via _emit_replace.  Returning content here
-                # would cause Open WebUI to append it as a second
-                # response or re-trigger the pipe.
-                return ""
+                # Return the report as the final message content.
+                # The _DONE_MARKER prevents the re-entry guard at the top
+                # of pipe() from re-running research on any subsequent
+                # invocation in the same conversation.
+                return report_with_marker
 
         except Exception as e:
             log.error(f"Deep Research error: {e}", exc_info=True)
