@@ -203,6 +203,117 @@ def _plain_text_from_html(html: str) -> str:
     return text
 
 
+def _norm_heading(s: str) -> str:
+    """Normalize a heading for fuzzy comparison: lowercase, collapse whitespace, drop punctuation edges."""
+    s = (s or "").lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    # Strip leading/trailing punctuation often added by anchor links (¶, #, etc.)
+    s = s.strip("¶#§*•·.:;-—–_ ")
+    return s
+
+
+def _find_section(soup: BeautifulSoup, section: str) -> Optional[dict]:
+    """
+    Locate a heading matching `section` (exact match preferred, substring fallback)
+    and return the text content from that heading up to the next heading of
+    equal-or-higher level.
+
+    Returns dict with: matched_heading, level, text, next_heading (or None if last).
+    Returns None if no heading matched.
+    """
+    if not section:
+        return None
+
+    target = _norm_heading(section)
+    if not target:
+        return None
+
+    # Strip non-content nodes first
+    for t in soup(["script", "style", "noscript", "template", "iframe", "svg"]):
+        t.decompose()
+
+    headings = soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
+    if not headings:
+        return None
+
+    # Pass 1: exact normalized match. Pass 2: substring match.
+    matched = None
+    for h in headings:
+        if _norm_heading(h.get_text(" ", strip=True)) == target:
+            matched = h
+            break
+    if matched is None:
+        for h in headings:
+            ht = _norm_heading(h.get_text(" ", strip=True))
+            if target in ht or ht in target:
+                # Avoid trivial/empty matches
+                if ht and len(ht) >= 3:
+                    matched = h
+                    break
+    if matched is None:
+        return None
+
+    matched_level = int(matched.name[1])
+    matched_text = " ".join(matched.get_text(" ", strip=True).split())
+
+    # Walk forward through siblings/descendants, collecting text until we hit
+    # another heading at the same or higher (numerically lower) level.
+    pieces: list[str] = []
+    next_heading_text: Optional[str] = None
+
+    # Use the document order traversal: iterate over all elements after the matched heading.
+    for el in matched.find_all_next():
+        if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            try:
+                lvl = int(el.name[1])
+            except ValueError:
+                lvl = 99
+            if lvl <= matched_level:
+                next_heading_text = " ".join(el.get_text(" ", strip=True).split())
+                break
+            # Subheading inside this section — include it as its own line for readability
+            sub = " ".join(el.get_text(" ", strip=True).split())
+            if sub:
+                pieces.append(f"\n## {sub}\n")
+            continue
+        # Skip elements whose content is already covered by an ancestor we've handled.
+        # The simplest robust approach: only collect text from "leaf-ish" content blocks.
+        if el.name in ("p", "li", "pre", "code", "blockquote", "td", "th", "dd", "dt", "figcaption"):
+            txt = el.get_text(" ", strip=True)
+            if txt:
+                pieces.append(txt)
+
+    # Fallback: if we collected nothing (page uses divs everywhere), grab raw text between markers.
+    if not pieces:
+        # Build a flat text walk from matched heading forward, stopping at the next same/higher heading
+        collected: list[str] = []
+        for el in matched.find_all_next(string=False):
+            if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                try:
+                    lvl = int(el.name[1])
+                except ValueError:
+                    lvl = 99
+                if lvl <= matched_level:
+                    if next_heading_text is None:
+                        next_heading_text = " ".join(el.get_text(" ", strip=True).split())
+                    break
+            txt = el.get_text(" ", strip=True) if hasattr(el, "get_text") else ""
+            if txt and txt not in collected:
+                collected.append(txt)
+        body_text = "\n\n".join(collected)
+    else:
+        body_text = "\n\n".join(pieces)
+
+    body_text = re.sub(r"\n{3,}", "\n\n", body_text).strip()
+
+    return {
+        "matched_heading": matched_text,
+        "level": matched_level,
+        "text": body_text,
+        "next_heading": next_heading_text,
+    }
+
+
 def _structured_from_html(html: str, url: str) -> dict:
     """Return a structured representation of the page."""
     soup = BeautifulSoup(html, "lxml")
@@ -599,7 +710,7 @@ class Tools:
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> str:
         """
-        Search the web via SearXNG and return a ranked list of results.
+        Search the web and return a ranked list of results.
 
         Use this when you don't already know the answer, the question concerns
         current events, or you need to verify a fact. Craft a focused query
@@ -724,6 +835,7 @@ class Tools:
         self,
         url: str,
         mode: str = "text",
+        section: Optional[str] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> str:
         """
@@ -737,13 +849,29 @@ class Tools:
                         Article, etc.). Best for understanding what's on a page
                         without downloading the full body.
 
-        If the page is blocked by Cloudflare / a CAPTCHA interstitial and a
-        FlareSolverr instance is configured, it will be retried through that
-        automatically. Reddit links are automatically redirected to the .json
-        endpoint for reliability.
+        OPTIONAL: if you already know which section you care about (for example
+        because search_web returned a page_headings outline that listed it),
+        pass the heading text as `section` to get back ONLY that section instead
+        of the whole page. This is the most context-efficient option — prefer it
+        when the user's question maps to a specific section.
+
+        Examples:
+        - User asks "what are the side effects?" and the headings include
+          "Side effects" → call with section="Side effects".
+        - User asks for installation steps and the page has an "Installation"
+          heading → call with section="Installation".
+        - User wants the whole article → omit section.
+
+        Matching is case-insensitive and tolerant of whitespace; substring
+        matches are accepted as a fallback. The returned content runs from the
+        matched heading to the next heading at the same or higher level.
+
+        `section` only applies to HTML pages. It is ignored for PDFs and JSON
+        responses (e.g. Reddit), which return their full content as before.
 
         :param url: Absolute URL to fetch (http/https).
         :param mode: "text" or "structured".
+        :param section: Optional heading text to extract just that section.
         :return: JSON string with the result.
         """
         v = self.valves
@@ -756,6 +884,8 @@ class Tools:
         mode = (mode or "text").lower().strip()
         if mode not in ("text", "structured"):
             return json.dumps({"error": f"Invalid mode '{mode}'. Use 'text' or 'structured'."})
+
+        section = (section or "").strip() or None
 
         # Reddit rewrite
         fetch_url = _normalize_reddit_url(url)
@@ -879,17 +1009,80 @@ class Tools:
             )
 
         # mode == "text"
+        # Build soup once; reused for title + optional section extraction.
+        try:
+            full_soup = BeautifulSoup(text, "lxml")
+        except Exception as e:
+            return json.dumps({"error": f"Failed to parse HTML: {e}", "url": fetch_url})
+
+        soup_title = _page_title(full_soup)
+
+        # Section-only extraction
+        if section:
+            await _emit_status(__event_emitter__, f"Extracting section: {section}")
+            section_data = _find_section(full_soup, section)
+            if section_data is None:
+                # Surface available headings so the model can retry with a valid one
+                available = [
+                    h.get_text(" ", strip=True)
+                    for h in full_soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
+                ]
+                available = [a for a in (a.strip() for a in available) if a][: v.MAX_ENRICH_HEADINGS]
+                await _emit_status(
+                    __event_emitter__, f"Section '{section}' not found.", done=True
+                )
+                return json.dumps(
+                    {
+                        "url": fetch_url,
+                        "original_url": url,
+                        "status": status,
+                        "content_type": ctype,
+                        "via": via,
+                        "format": "section",
+                        "error": f"Section '{section}' not found on page.",
+                        "available_headings": available,
+                        "hint": (
+                            "Retry with a heading from `available_headings`, or omit "
+                            "`section` to fetch the whole page."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+            section_text = section_data["text"]
+            # Prepend the matched heading for context
+            section_body = f"# {section_data['matched_heading']}\n\n{section_text}".strip()
+            section_body = _trim(section_body, v.MAX_PAGE_CHARS)
+
+            await self._maybe_emit_citation(
+                __event_emitter__,
+                fetch_url,
+                f"{soup_title or fetch_url} — {section_data['matched_heading']}",
+                section_body,
+            )
+            await _emit_status(__event_emitter__, "Done.", done=True)
+            return json.dumps(
+                {
+                    "url": fetch_url,
+                    "original_url": url,
+                    "status": status,
+                    "content_type": ctype,
+                    "via": via,
+                    "format": "section",
+                    "title": soup_title,
+                    "matched_heading": section_data["matched_heading"],
+                    "level": section_data["level"],
+                    "next_heading": section_data["next_heading"],
+                    "content": section_body,
+                },
+                ensure_ascii=False,
+            )
+
+        # Whole-page text
         try:
             plain = _plain_text_from_html(text)
         except Exception as e:
             return json.dumps({"error": f"Failed to parse HTML: {e}", "url": fetch_url})
-
-        # Prepend title for context
-        soup_title = None
-        try:
-            soup_title = _page_title(BeautifulSoup(text, "lxml"))
-        except Exception:
-            pass
 
         if soup_title:
             plain = f"{soup_title}\n\n{plain}"
