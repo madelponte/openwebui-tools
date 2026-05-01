@@ -1,7 +1,7 @@
 """
 title: Stock Data
-author: open-webui-community
-author_url: https://github.com/open-webui
+author: mdelponte
+author_url: https://github.com/mdelponte
 version: 1.0.0
 required_open_webui_version: 0.4.0
 license: MIT
