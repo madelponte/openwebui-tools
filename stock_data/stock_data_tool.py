@@ -1,11 +1,11 @@
 """
 title: Stock Data
-author: open-webui-community
-author_url: https://github.com/open-webui
-version: 1.0.0
+author: mdelponte
+author_url: https://github.com/mdelponte
+version: 1.1.0
 required_open_webui_version: 0.4.0
 license: MIT
-description: Query stock market data — quotes, fundamentals, financials, earnings, and news. Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally Financial Modeling Prep for deep financial statements.
+description: Query stock market data — quotes, fundamentals, financials, earnings, news, and stock screening. Uses Finnhub (primary, free API key), yfinance (no-key fallback), and Financial Modeling Prep for deep financials and screening.
 requirements: requests, yfinance
 """
 
@@ -81,12 +81,17 @@ class Tools:
       - Earnings calendar and historical earnings (actual vs estimate, surprises)
       - Recent company news
       - Analyst recommendations
+      - Stock screening by basic criteria (market cap, price, volume, sector, etc.)
+      - Advanced fundamental screening (cash on hand, P/E, ROE, margins, debt, etc.)
 
     Provider strategy (controlled by valves):
       - "auto":      Try Finnhub first if key set, else yfinance. Fall back across providers on failure.
       - "finnhub":   Force Finnhub (requires API key).
       - "yfinance":  Force yfinance (no key needed; unofficial Yahoo scraping).
       - "fmp":       Force Financial Modeling Prep (requires API key).
+
+    Note: Stock screening tools require an FMP API key (free tier available at
+    financialmodelingprep.com). Quotes/profiles/news work without any keys via yfinance.
     """
 
     class Valves(BaseModel):
@@ -98,7 +103,7 @@ class Tools:
         )
         fmp_api_key: str = Field(
             default="",
-            description="Financial Modeling Prep API key (optional, free tier ~250/day). Used for deep financial statements when set.",
+            description="Financial Modeling Prep API key (free tier ~250/day). Required for stock screening. Used for deep financial statements when set.",
             json_schema_extra={"input": {"type": "password"}},
         )
         alpha_vantage_api_key: str = Field(
@@ -137,6 +142,14 @@ class Tools:
         max_financial_periods: int = Field(
             default=4,
             description="Maximum number of historical financial statement periods (years or quarters) to return.",
+        )
+        screener_result_limit: int = Field(
+            default=25,
+            description="Maximum number of stocks returned by screening tools. Higher values use more API quota, especially for fundamentals-based screening.",
+        )
+        screener_universe_size: int = Field(
+            default=200,
+            description="When screening by fundamentals (cash, P/E, etc.), how large an initial universe to pull from FMP before filtering. Higher = more thorough but slower.",
         )
 
     class UserValves(BaseModel):
@@ -599,6 +612,456 @@ class Tools:
         except Exception as e:
             await self._emit(__event_emitter__, "Search failed", done=True, user=__user__)
             return json.dumps({"error": f"Search failed: {type(e).__name__}: {e}", "query": query})
+
+    async def screen_stocks(
+        self,
+        market_cap_more_than: Optional[float] = None,
+        market_cap_less_than: Optional[float] = None,
+        price_more_than: Optional[float] = None,
+        price_less_than: Optional[float] = None,
+        volume_more_than: Optional[int] = None,
+        volume_less_than: Optional[int] = None,
+        beta_more_than: Optional[float] = None,
+        beta_less_than: Optional[float] = None,
+        dividend_more_than: Optional[float] = None,
+        dividend_less_than: Optional[float] = None,
+        sector: Optional[str] = None,
+        industry: Optional[str] = None,
+        country: Optional[str] = None,
+        exchange: Optional[str] = None,
+        is_etf: Optional[bool] = None,
+        is_fund: Optional[bool] = None,
+        is_actively_trading: Optional[bool] = True,
+        __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ) -> str:
+        """
+        Screen stocks by basic market criteria. Returns a list of companies matching all the
+        specified filters. All parameters are optional — only provided ones are applied.
+
+        Use this for queries like "find tech stocks with market cap over $10B" or
+        "show me NYSE-listed dividend stocks under $50". For deeper fundamentals-based
+        screening (cash on hand, P/E ratio, ROE, etc.), use screen_by_fundamentals instead.
+
+        :param market_cap_more_than: Minimum market cap in raw dollars (e.g. 10000000000 for $10B).
+        :param market_cap_less_than: Maximum market cap in raw dollars.
+        :param price_more_than: Minimum share price.
+        :param price_less_than: Maximum share price.
+        :param volume_more_than: Minimum daily trading volume.
+        :param volume_less_than: Maximum daily trading volume.
+        :param beta_more_than: Minimum beta (volatility relative to market; >1 means more volatile).
+        :param beta_less_than: Maximum beta.
+        :param dividend_more_than: Minimum dividend per share.
+        :param dividend_less_than: Maximum dividend per share.
+        :param sector: Sector name. Common values: "Technology", "Healthcare", "Financial Services",
+            "Consumer Cyclical", "Consumer Defensive", "Energy", "Industrials", "Basic Materials",
+            "Communication Services", "Real Estate", "Utilities".
+        :param industry: Industry name (e.g. "Software", "Banks", "Semiconductors").
+        :param country: ISO-2 country code (e.g. "US", "UK", "CA", "JP", "DE").
+        :param exchange: Exchange name. Common values: "nyse", "nasdaq", "amex", "tsx", "lse".
+        :param is_etf: Filter to/from ETFs (True = only ETFs, False = exclude ETFs).
+        :param is_fund: Filter to/from mutual funds.
+        :param is_actively_trading: Only return actively trading securities (default True).
+        :return: A JSON string with matching stocks (symbol, name, market cap, price, sector, etc.).
+        """
+        if not self.valves.fmp_api_key:
+            return json.dumps({
+                "error": "Stock screening requires a Financial Modeling Prep (FMP) API key. "
+                         "Configure 'fmp_api_key' in the tool valves. Free tier available at financialmodelingprep.com."
+            })
+
+        await self._emit(__event_emitter__, "Screening stocks…", user=__user__)
+
+        params: dict[str, Any] = {
+            "apikey": self.valves.fmp_api_key,
+            "limit": self.valves.screener_result_limit,
+        }
+        if market_cap_more_than is not None:
+            params["marketCapMoreThan"] = int(market_cap_more_than)
+        if market_cap_less_than is not None:
+            params["marketCapLowerThan"] = int(market_cap_less_than)
+        if price_more_than is not None:
+            params["priceMoreThan"] = price_more_than
+        if price_less_than is not None:
+            params["priceLowerThan"] = price_less_than
+        if volume_more_than is not None:
+            params["volumeMoreThan"] = int(volume_more_than)
+        if volume_less_than is not None:
+            params["volumeLowerThan"] = int(volume_less_than)
+        if beta_more_than is not None:
+            params["betaMoreThan"] = beta_more_than
+        if beta_less_than is not None:
+            params["betaLowerThan"] = beta_less_than
+        if dividend_more_than is not None:
+            params["dividendMoreThan"] = dividend_more_than
+        if dividend_less_than is not None:
+            params["dividendLowerThan"] = dividend_less_than
+        if sector:
+            params["sector"] = sector
+        if industry:
+            params["industry"] = industry
+        if country:
+            params["country"] = country.upper()
+        if exchange:
+            params["exchange"] = exchange.lower()
+        if is_etf is not None:
+            params["isEtf"] = "true" if is_etf else "false"
+        if is_fund is not None:
+            params["isFund"] = "true" if is_fund else "false"
+        if is_actively_trading is not None:
+            params["isActivelyTrading"] = "true" if is_actively_trading else "false"
+
+        try:
+            data = await asyncio.to_thread(
+                self._http_get_json,
+                "https://financialmodelingprep.com/api/v3/stock-screener",
+                params,
+            )
+        except requests.HTTPError as e:
+            await self._emit(__event_emitter__, "Screening failed", done=True, user=__user__)
+            return json.dumps({
+                "error": f"FMP screener API error: {e}",
+                "hint": "If this is a 403, your free tier may not include the screener endpoint, or you've hit the daily limit.",
+            })
+        except Exception as e:
+            await self._emit(__event_emitter__, "Screening failed", done=True, user=__user__)
+            return json.dumps({"error": f"Screener failed: {type(e).__name__}: {e}"})
+
+        if not isinstance(data, list):
+            return json.dumps({
+                "error": "Unexpected response from FMP screener.",
+                "raw": data,
+            })
+
+        results = []
+        for item in data[: self.valves.screener_result_limit]:
+            mc = _safe_float(item.get("marketCap"))
+            results.append({
+                "symbol": item.get("symbol"),
+                "name": item.get("companyName"),
+                "sector": item.get("sector"),
+                "industry": item.get("industry"),
+                "exchange": item.get("exchangeShortName") or item.get("exchange"),
+                "country": item.get("country"),
+                "price": _safe_float(item.get("price")),
+                "market_cap": mc,
+                "market_cap_formatted": _format_large_number(mc),
+                "beta": _safe_float(item.get("beta")),
+                "volume": _safe_int(item.get("volume")),
+                "last_dividend": _safe_float(item.get("lastAnnualDividend")),
+            })
+
+        # Build a summary of which filters were applied for the model's context
+        applied = {k: v for k, v in {
+            "market_cap_more_than": market_cap_more_than,
+            "market_cap_less_than": market_cap_less_than,
+            "price_more_than": price_more_than,
+            "price_less_than": price_less_than,
+            "volume_more_than": volume_more_than,
+            "volume_less_than": volume_less_than,
+            "beta_more_than": beta_more_than,
+            "beta_less_than": beta_less_than,
+            "dividend_more_than": dividend_more_than,
+            "dividend_less_than": dividend_less_than,
+            "sector": sector,
+            "industry": industry,
+            "country": country,
+            "exchange": exchange,
+            "is_etf": is_etf,
+            "is_fund": is_fund,
+            "is_actively_trading": is_actively_trading,
+        }.items() if v is not None}
+
+        await self._emit(__event_emitter__, f"Found {len(results)} matches", done=True, user=__user__)
+        return json.dumps({
+            "filters_applied": applied,
+            "count": len(results),
+            "results": results,
+        }, default=str)
+
+    async def screen_by_fundamentals(
+        self,
+        cash_more_than: Optional[float] = None,
+        cash_less_than: Optional[float] = None,
+        debt_less_than: Optional[float] = None,
+        revenue_more_than: Optional[float] = None,
+        net_income_more_than: Optional[float] = None,
+        pe_more_than: Optional[float] = None,
+        pe_less_than: Optional[float] = None,
+        pb_less_than: Optional[float] = None,
+        ps_less_than: Optional[float] = None,
+        roe_more_than: Optional[float] = None,
+        gross_margin_more_than: Optional[float] = None,
+        net_margin_more_than: Optional[float] = None,
+        debt_to_equity_less_than: Optional[float] = None,
+        current_ratio_more_than: Optional[float] = None,
+        dividend_yield_more_than: Optional[float] = None,
+        market_cap_more_than: Optional[float] = None,
+        market_cap_less_than: Optional[float] = None,
+        sector: Optional[str] = None,
+        industry: Optional[str] = None,
+        country: Optional[str] = None,
+        exchange: Optional[str] = None,
+        __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ) -> str:
+        """
+        Advanced screener that filters companies by fundamental balance-sheet and
+        valuation metrics — including cash on hand, debt, P/E ratio, ROE, margins, etc.
+
+        Internally this works in two passes: it first screens by basic market criteria
+        (market cap, sector, country, exchange) to narrow the universe, then fetches
+        TTM key metrics for each candidate and applies the fundamental filters.
+
+        Use this for queries like "find tech companies with more than $10B in cash and
+        P/E under 20" or "small caps with positive ROE and low debt-to-equity".
+
+        Note: This makes one API call per candidate company on top of the initial screen,
+        so it consumes more API quota than screen_stocks. The screener_universe_size valve
+        controls how many candidates are pulled before filtering (default 200).
+
+        :param cash_more_than: Minimum cash and short-term investments in raw dollars (e.g. 10000000000 for $10B).
+        :param cash_less_than: Maximum cash and short-term investments.
+        :param debt_less_than: Maximum total debt in raw dollars.
+        :param revenue_more_than: Minimum trailing-twelve-month revenue.
+        :param net_income_more_than: Minimum trailing-twelve-month net income (profitability filter).
+        :param pe_more_than: Minimum P/E ratio.
+        :param pe_less_than: Maximum P/E ratio (e.g. 20 for "value" stocks).
+        :param pb_less_than: Maximum price-to-book ratio.
+        :param ps_less_than: Maximum price-to-sales ratio.
+        :param roe_more_than: Minimum return on equity (as a decimal, e.g. 0.15 for 15%).
+        :param gross_margin_more_than: Minimum gross margin (decimal, e.g. 0.40 for 40%).
+        :param net_margin_more_than: Minimum net profit margin (decimal).
+        :param debt_to_equity_less_than: Maximum debt-to-equity ratio.
+        :param current_ratio_more_than: Minimum current ratio (liquidity filter; >1 typical).
+        :param dividend_yield_more_than: Minimum dividend yield (decimal, e.g. 0.03 for 3%).
+        :param market_cap_more_than: Minimum market cap to narrow the initial universe.
+        :param market_cap_less_than: Maximum market cap.
+        :param sector: Sector to limit the search to.
+        :param industry: Industry to limit the search to.
+        :param country: ISO-2 country code (e.g. "US").
+        :param exchange: Exchange name (e.g. "nasdaq").
+        :return: A JSON string with matching companies and the metrics that triggered the match.
+        """
+        if not self.valves.fmp_api_key:
+            return json.dumps({
+                "error": "Fundamental screening requires a Financial Modeling Prep (FMP) API key. "
+                         "Configure 'fmp_api_key' in the tool valves. Free tier available at financialmodelingprep.com."
+            })
+
+        await self._emit(__event_emitter__, "Building candidate universe…", user=__user__)
+
+        # Stage 1: Build a candidate universe via the basic screener using whatever
+        # quick filters we have. We pull screener_universe_size candidates here.
+        universe_params: dict[str, Any] = {
+            "apikey": self.valves.fmp_api_key,
+            "limit": self.valves.screener_universe_size,
+            "isActivelyTrading": "true",
+        }
+        if market_cap_more_than is not None:
+            universe_params["marketCapMoreThan"] = int(market_cap_more_than)
+        if market_cap_less_than is not None:
+            universe_params["marketCapLowerThan"] = int(market_cap_less_than)
+        if sector:
+            universe_params["sector"] = sector
+        if industry:
+            universe_params["industry"] = industry
+        if country:
+            universe_params["country"] = country.upper()
+        if exchange:
+            universe_params["exchange"] = exchange.lower()
+
+        try:
+            universe = await asyncio.to_thread(
+                self._http_get_json,
+                "https://financialmodelingprep.com/api/v3/stock-screener",
+                universe_params,
+            )
+        except Exception as e:
+            await self._emit(__event_emitter__, "Universe build failed", done=True, user=__user__)
+            return json.dumps({"error": f"Universe screener failed: {type(e).__name__}: {e}"})
+
+        if not isinstance(universe, list) or not universe:
+            await self._emit(__event_emitter__, "No candidates found", done=True, user=__user__)
+            return json.dumps({
+                "filters_applied": {},
+                "count": 0,
+                "results": [],
+                "note": "No companies matched the initial market-cap/sector/country filters.",
+            })
+
+        candidate_count = len(universe)
+        await self._emit(
+            __event_emitter__,
+            f"Filtering {candidate_count} candidates by fundamentals…",
+            user=__user__,
+        )
+
+        # Stage 2: Fetch TTM key metrics for each candidate and filter.
+        # We do this concurrently with a bounded thread pool to keep it reasonably fast
+        # while respecting FMP's rate limits.
+        sem_limit = 5  # concurrent in-flight requests
+        sem = asyncio.Semaphore(sem_limit)
+
+        async def fetch_metrics(symbol: str) -> Optional[dict]:
+            async with sem:
+                try:
+                    return await asyncio.to_thread(
+                        self._http_get_json,
+                        f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{symbol}",
+                        {"apikey": self.valves.fmp_api_key},
+                    )
+                except Exception:
+                    return None
+
+        symbols = [u.get("symbol") for u in universe if u.get("symbol")]
+        metric_responses = await asyncio.gather(*[fetch_metrics(s) for s in symbols])
+
+        # Build a quick lookup: symbol -> universe row (for company name/price)
+        universe_by_symbol = {u.get("symbol"): u for u in universe}
+
+        results: list[dict] = []
+        for symbol, metric_resp in zip(symbols, metric_responses):
+            if not metric_resp or not isinstance(metric_resp, list) or not metric_resp[0]:
+                continue
+            m = metric_resp[0]
+
+            # Extract TTM values; FMP names are camelCase TTM fields
+            cash = _safe_float(m.get("cashAndShortTermInvestmentsTTM") or m.get("cashAndCashEquivalentsTTM"))
+            debt = _safe_float(m.get("totalDebtTTM"))
+            pe = _safe_float(m.get("peRatioTTM"))
+            pb = _safe_float(m.get("pbRatioTTM"))
+            ps = _safe_float(m.get("priceToSalesRatioTTM"))
+            roe = _safe_float(m.get("roeTTM"))
+            gross_margin = _safe_float(m.get("grossProfitMarginTTM"))
+            net_margin = _safe_float(m.get("netProfitMarginTTM"))
+            debt_to_equity = _safe_float(m.get("debtToEquityTTM"))
+            current_ratio = _safe_float(m.get("currentRatioTTM"))
+            dividend_yield = _safe_float(m.get("dividendYieldTTM"))
+            market_cap = _safe_float(m.get("marketCapTTM"))
+
+            # Apply each filter. None means "skip this filter".
+            def fail_min(value: Optional[float], threshold: Optional[float]) -> bool:
+                return threshold is not None and (value is None or value < threshold)
+
+            def fail_max(value: Optional[float], threshold: Optional[float]) -> bool:
+                return threshold is not None and (value is None or value > threshold)
+
+            if fail_min(cash, cash_more_than):
+                continue
+            if fail_max(cash, cash_less_than):
+                continue
+            if fail_max(debt, debt_less_than):
+                continue
+            if fail_min(pe, pe_more_than):
+                continue
+            if fail_max(pe, pe_less_than):
+                continue
+            if fail_max(pb, pb_less_than):
+                continue
+            if fail_max(ps, ps_less_than):
+                continue
+            if fail_min(roe, roe_more_than):
+                continue
+            if fail_min(gross_margin, gross_margin_more_than):
+                continue
+            if fail_min(net_margin, net_margin_more_than):
+                continue
+            if fail_max(debt_to_equity, debt_to_equity_less_than):
+                continue
+            if fail_min(current_ratio, current_ratio_more_than):
+                continue
+            if fail_min(dividend_yield, dividend_yield_more_than):
+                continue
+
+            # Revenue and net income filters require an extra income-statement call.
+            # Do it lazily — only for candidates that have already passed all other filters.
+            if revenue_more_than is not None or net_income_more_than is not None:
+                try:
+                    inc = await asyncio.to_thread(
+                        self._http_get_json,
+                        f"https://financialmodelingprep.com/api/v3/income-statement/{symbol}",
+                        {"apikey": self.valves.fmp_api_key, "limit": 1, "period": "annual"},
+                    )
+                    row = inc[0] if (inc and isinstance(inc, list)) else {}
+                    actual_rev = _safe_float(row.get("revenue"))
+                    actual_ni = _safe_float(row.get("netIncome"))
+                    if revenue_more_than is not None and (actual_rev is None or actual_rev < revenue_more_than):
+                        continue
+                    if net_income_more_than is not None and (actual_ni is None or actual_ni < net_income_more_than):
+                        continue
+                except Exception:
+                    continue
+
+            u_row = universe_by_symbol.get(symbol, {})
+            results.append({
+                "symbol": symbol,
+                "name": u_row.get("companyName"),
+                "sector": u_row.get("sector"),
+                "industry": u_row.get("industry"),
+                "exchange": u_row.get("exchangeShortName") or u_row.get("exchange"),
+                "price": _safe_float(u_row.get("price")),
+                "market_cap": market_cap,
+                "market_cap_formatted": _format_large_number(market_cap),
+                "metrics": {
+                    "cash_and_st_investments": cash,
+                    "cash_formatted": _format_large_number(cash),
+                    "total_debt": debt,
+                    "total_debt_formatted": _format_large_number(debt),
+                    "pe_ratio": pe,
+                    "pb_ratio": pb,
+                    "ps_ratio": ps,
+                    "roe": roe,
+                    "gross_margin": gross_margin,
+                    "net_margin": net_margin,
+                    "debt_to_equity": debt_to_equity,
+                    "current_ratio": current_ratio,
+                    "dividend_yield": dividend_yield,
+                },
+            })
+
+            # Stop early once we have enough matches
+            if len(results) >= self.valves.screener_result_limit:
+                break
+
+        applied_filters = {k: v for k, v in {
+            "cash_more_than": cash_more_than,
+            "cash_less_than": cash_less_than,
+            "debt_less_than": debt_less_than,
+            "revenue_more_than": revenue_more_than,
+            "net_income_more_than": net_income_more_than,
+            "pe_more_than": pe_more_than,
+            "pe_less_than": pe_less_than,
+            "pb_less_than": pb_less_than,
+            "ps_less_than": ps_less_than,
+            "roe_more_than": roe_more_than,
+            "gross_margin_more_than": gross_margin_more_than,
+            "net_margin_more_than": net_margin_more_than,
+            "debt_to_equity_less_than": debt_to_equity_less_than,
+            "current_ratio_more_than": current_ratio_more_than,
+            "dividend_yield_more_than": dividend_yield_more_than,
+            "market_cap_more_than": market_cap_more_than,
+            "market_cap_less_than": market_cap_less_than,
+            "sector": sector,
+            "industry": industry,
+            "country": country,
+            "exchange": exchange,
+        }.items() if v is not None}
+
+        await self._emit(
+            __event_emitter__,
+            f"Found {len(results)} matches from {candidate_count} candidates",
+            done=True,
+            user=__user__,
+        )
+
+        return json.dumps({
+            "filters_applied": applied_filters,
+            "candidates_screened": candidate_count,
+            "count": len(results),
+            "results": results,
+            "note": "Metrics shown are TTM (trailing twelve months). Margins/yields/ROE are decimals (0.15 = 15%).",
+        }, default=str)
 
     # ===================================================================
     #                       PROVIDER: FINNHUB
