@@ -32,6 +32,18 @@ class Tools:
         or could be interpreted in multiple ways. Call this tool once per
         question. You may call it multiple times in sequence to ask
         several clarifying questions before producing your final answer.
+        Examples of good times to use it:
+            • The user asks for "a script" but doesn't say what
+              language, runtime, or platform.
+            • The user asks you to "rewrite this" without saying
+              what to change (tone, length, audience, format).
+            • The user references something ("the file", "my project",
+              "that thing we discussed") that you have no context for.
+            • The user asks for a recommendation but hasn't shared
+              the constraints (budget, skill level, use case).
+            • A task could be done several very different ways and
+              the choice meaningfully changes the output.
+
 
         :param question: The clarifying question to ask the user.
         :return: The user's response to the question.
