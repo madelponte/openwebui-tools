@@ -2,14 +2,14 @@
 title: Stock Data
 author: mdelponte
 author_url: https://github.com/mdelponte
-version: 1.0.0
-required_open_webui_version: 0.4.0
+version: 1.0.1
+required_open_webui_version: 0.5.0
 license: MIT
 description: Query stock market data — quotes, fundamentals, financials, earnings, and news. Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally Financial Modeling Prep for deep financial statements.
 requirements: requests, yfinance
 """
 
-import asyncio
+import anyio
 import json
 import time
 from datetime import datetime, timezone
@@ -264,11 +264,11 @@ class Tools:
 
         try:
             if provider == "finnhub":
-                result = await asyncio.to_thread(self._finnhub_quote, symbol)
+                result = await anyio.to_thread.run_sync(self._finnhub_quote, symbol)
             elif provider == "yfinance":
-                result = await asyncio.to_thread(self._yfinance_quote, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_quote, symbol)
             elif provider == "fmp":
-                result = await asyncio.to_thread(self._fmp_quote, symbol)
+                result = await anyio.to_thread.run_sync(self._fmp_quote, symbol)
         except Exception as e:
             errors.append(f"{provider}: {type(e).__name__}: {e}")
             result = None
@@ -277,7 +277,7 @@ class Tools:
         if (not result) and self.valves.prefer_yfinance_fallback and provider != "yfinance":
             await self._emit(__event_emitter__, f"Primary provider failed, trying yfinance…", user=__user__)
             try:
-                result = await asyncio.to_thread(self._yfinance_quote, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_quote, symbol)
             except Exception as e:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
@@ -317,18 +317,18 @@ class Tools:
 
         try:
             if provider == "finnhub":
-                result = await asyncio.to_thread(self._finnhub_profile, symbol)
+                result = await anyio.to_thread.run_sync(self._finnhub_profile, symbol)
             elif provider == "yfinance":
-                result = await asyncio.to_thread(self._yfinance_profile, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_profile, symbol)
             elif provider == "fmp":
-                result = await asyncio.to_thread(self._fmp_profile, symbol)
+                result = await anyio.to_thread.run_sync(self._fmp_profile, symbol)
         except Exception as e:
             errors.append(f"{provider}: {type(e).__name__}: {e}")
 
         if (not result) and self.valves.prefer_yfinance_fallback and provider != "yfinance":
             await self._emit(__event_emitter__, "Primary provider failed, trying yfinance…", user=__user__)
             try:
-                result = await asyncio.to_thread(self._yfinance_profile, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_profile, symbol)
             except Exception as e:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
@@ -381,18 +381,18 @@ class Tools:
 
         try:
             if provider == "fmp":
-                result = await asyncio.to_thread(self._fmp_financials, symbol, statement, period)
+                result = await anyio.to_thread.run_sync(self._fmp_financials, symbol, statement, period)
             elif provider == "yfinance":
-                result = await asyncio.to_thread(self._yfinance_financials, symbol, statement, period)
+                result = await anyio.to_thread.run_sync(self._yfinance_financials, symbol, statement, period)
             elif provider == "finnhub":
-                result = await asyncio.to_thread(self._finnhub_financials, symbol, statement, period)
+                result = await anyio.to_thread.run_sync(self._finnhub_financials, symbol, statement, period)
         except Exception as e:
             errors.append(f"{provider}: {type(e).__name__}: {e}")
 
         if (not result) and self.valves.prefer_yfinance_fallback and provider != "yfinance":
             await self._emit(__event_emitter__, "Primary provider failed, trying yfinance…", user=__user__)
             try:
-                result = await asyncio.to_thread(self._yfinance_financials, symbol, statement, period)
+                result = await anyio.to_thread.run_sync(self._yfinance_financials, symbol, statement, period)
             except Exception as e:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
@@ -433,17 +433,17 @@ class Tools:
         provider = self._resolve_provider(self.valves.default_provider)
         try:
             if provider == "finnhub":
-                result = await asyncio.to_thread(self._finnhub_earnings, symbol)
+                result = await anyio.to_thread.run_sync(self._finnhub_earnings, symbol)
             elif provider == "fmp":
-                result = await asyncio.to_thread(self._fmp_earnings, symbol)
+                result = await anyio.to_thread.run_sync(self._fmp_earnings, symbol)
             else:
-                result = await asyncio.to_thread(self._yfinance_earnings, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_earnings, symbol)
         except Exception as e:
             errors.append(f"{provider}: {type(e).__name__}: {e}")
 
         if (not result) and self.valves.prefer_yfinance_fallback and provider != "yfinance":
             try:
-                result = await asyncio.to_thread(self._yfinance_earnings, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_earnings, symbol)
             except Exception as e:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
@@ -483,15 +483,15 @@ class Tools:
         provider = self._resolve_provider(self.valves.default_provider)
         try:
             if provider == "finnhub":
-                result = await asyncio.to_thread(self._finnhub_news, symbol)
+                result = await anyio.to_thread.run_sync(self._finnhub_news, symbol)
             else:
-                result = await asyncio.to_thread(self._yfinance_news, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_news, symbol)
         except Exception as e:
             errors.append(f"{provider}: {type(e).__name__}: {e}")
 
         if (not result) and self.valves.prefer_yfinance_fallback and provider != "yfinance":
             try:
-                result = await asyncio.to_thread(self._yfinance_news, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_news, symbol)
             except Exception as e:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
@@ -531,15 +531,15 @@ class Tools:
 
         try:
             if provider == "finnhub":
-                result = await asyncio.to_thread(self._finnhub_recommendations, symbol)
+                result = await anyio.to_thread.run_sync(self._finnhub_recommendations, symbol)
             else:
-                result = await asyncio.to_thread(self._yfinance_recommendations, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_recommendations, symbol)
         except Exception as e:
             errors.append(f"{provider}: {type(e).__name__}: {e}")
 
         if (not result) and self.valves.prefer_yfinance_fallback and provider != "yfinance":
             try:
-                result = await asyncio.to_thread(self._yfinance_recommendations, symbol)
+                result = await anyio.to_thread.run_sync(self._yfinance_recommendations, symbol)
             except Exception as e:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
@@ -582,7 +582,7 @@ class Tools:
             })
 
         try:
-            data = await asyncio.to_thread(
+            data = await anyio.to_thread.run_sync(
                 self._http_get_json,
                 "https://finnhub.io/api/v1/search",
                 {"q": query, "token": self.valves.finnhub_api_key},

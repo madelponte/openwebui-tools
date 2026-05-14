@@ -2,12 +2,12 @@
 title: Ask Clarifying Questions
 description: Allows models to ask the user clarifying questions before proceeding. When enabled, the model can call this tool to pause and gather additional information from the user, reducing assumptions and improving response quality.
 author: mdelponte
-version: 1.0.0
+version: 1.0.1
 license: MIT
 """
 
 from pydantic import BaseModel, Field
-from typing import Callable, Any
+from typing import Awaitable, Callable, Any, Optional
 
 
 class Tools:
@@ -23,8 +23,8 @@ class Tools:
     async def ask_clarifying_question(
         self,
         question: str,
-        __event_call__: Callable[[dict], Any] = None,
-        __event_emitter__: Callable[[dict], Any] = None,
+        __event_call__: Optional[Callable[[dict], Awaitable[Any]]] = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> str:
         """
         Ask the user a clarifying question and wait for their response.

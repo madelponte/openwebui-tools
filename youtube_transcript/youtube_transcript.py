@@ -9,11 +9,13 @@ description: >
     Example commands: "summarize this video: https://youtu.be/dQw4w9WgXcQ",
     "what does this video say about X: <url>", "transcript of <url>".
 author: mdelponte
-version: 1.0.0
+version: 1.0.1
 license: MIT
 requirements: youtube-transcript-api
 """
 
+import anyio
+import functools
 import re
 from typing import Optional, Awaitable, Callable, List
 from urllib.parse import urlparse, parse_qs
@@ -256,13 +258,17 @@ class Tools:
 
             # Try preferred languages first, then fall back to anything available.
             try:
-                fetched = client.fetch(video_id, languages=lang_list)
+                fetched = await anyio.to_thread.run_sync(
+                    functools.partial(client.fetch, video_id, languages=lang_list)
+                )
             except NoTranscriptFound:
                 await _emit(
                     __event_emitter__,
                     "↪️ Preferred languages unavailable, trying any language…",
                 )
-                transcript_list = client.list(video_id)
+                transcript_list = await anyio.to_thread.run_sync(
+                    functools.partial(client.list, video_id)
+                )
                 # Pick the first available transcript (manually-created preferred
                 # by find_transcript ordering, but we just iterate).
                 any_transcript = None
@@ -271,7 +277,7 @@ class Tools:
                     break
                 if any_transcript is None:
                     raise
-                fetched = any_transcript.fetch()
+                fetched = await anyio.to_thread.run_sync(any_transcript.fetch)
 
             # fetched is a FetchedTranscript (iterable of FetchedTranscriptSnippet)
             snippets = list(fetched)
