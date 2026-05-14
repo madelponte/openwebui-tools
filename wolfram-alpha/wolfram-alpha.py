@@ -304,6 +304,10 @@ class Tools:
             6800,
             description="Max characters in Wolfram's response (default 6800).",
         )
+        render_card: bool = Field(
+            True,
+            description="If True, render results as an inline HTML card. If False, return plain text only (the LLM will format the response itself).",
+        )
 
     async def query_wolfram_alpha(
         self,
@@ -390,16 +394,18 @@ class Tools:
         # 501: Wolfram couldn't interpret the input. Body often has suggestions.
         if status == 501:
             await _emit(__event_emitter__, "⚠️ Wolfram could not interpret the query", done=True)
-            error_card = _build_error_card(
-                clean_query,
-                "Wolfram Alpha could not interpret this input.",
-                suggestions=body.strip() if body.strip() else None,
-            )
             text_for_llm = (
                 f"Wolfram Alpha could not interpret the query: '{clean_query}'.\n"
                 f"Suggestions from the API:\n{body.strip()}\n\n"
                 "Try rephrasing as a simpler keyword-style query, or pick one of "
                 "the suggested inputs above."
+            )
+            if not self.valves.render_card:
+                return text_for_llm
+            error_card = _build_error_card(
+                clean_query,
+                "Wolfram Alpha could not interpret this input.",
+                suggestions=body.strip() if body.strip() else None,
             )
             return (
                 HTMLResponse(content=error_card, headers={"content-disposition": "inline"}),
@@ -431,6 +437,9 @@ class Tools:
             return msg
 
         await _emit(__event_emitter__, "✅ Got result from Wolfram Alpha", done=True)
+
+        if not self.valves.render_card:
+            return body
 
         card_html = _build_card(clean_query, body)
         # Return both: the rendered card AND the raw text for the LLM to read.
