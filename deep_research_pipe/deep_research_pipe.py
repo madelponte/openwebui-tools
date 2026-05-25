@@ -1,7 +1,7 @@
 """
 title: Deep Research
 author: mdelponte
-version: 1.2.2
+version: 1.3.0
 license: MIT
 description: >
     A deep research pipe that takes a user query, generates a research plan
@@ -17,7 +17,6 @@ import json
 import logging
 import re
 import time
-from io import BytesIO
 from typing import (
     Any,
     Awaitable,
@@ -117,6 +116,12 @@ class Pipe:
                 "FlareSolverr URL (e.g. http://flaresolverr:8191/v1). "
                 "Blank = disabled."
             ),
+        )
+
+        # --- Apache Tika (PDF extraction) ---
+        TIKA_URL: str = Field(
+            default="http://tika:9998",
+            description="Base URL of your Apache Tika server used for PDF text extraction.",
         )
 
         # --- Snippet / context control ---
@@ -566,14 +571,19 @@ class Pipe:
 
     async def _extract_pdf(self, data: bytes) -> str:
         try:
-            import pypdf
-
-            reader = pypdf.PdfReader(BytesIO(data))
-            return "\n".join(p.extract_text() for p in reader.pages if p.extract_text())
-        except ImportError:
-            return "[PDF — pypdf not installed]"
-        except Exception:
-            return "[PDF — extraction failed]"
+            tika_url = f"{self.valves.TIKA_URL.rstrip('/')}/tika"
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    tika_url,
+                    data=data,
+                    headers={"Content-Type": "application/pdf", "Accept": "text/plain"},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    resp.raise_for_status()
+                    text = (await resp.text()).strip()
+                    return text if text else "[PDF contained no extractable text]"
+        except Exception as e:
+            return f"[PDF extraction failed: {e}]"
 
     # -----------------------------------------------------------------------
     # SearXNG

@@ -2,14 +2,13 @@
 title: Agentic Web Search
 author: mdelponte
 author_url: https://github.com/mdelponte
-version: 1.0.0
+version: 1.1.0
 license: MIT
 description: Lets the model decide when it needs to search the web, craft its own query, fetch pages, and use structured data. Uses a self-hosted SearXNG instance with optional FlareSolverr fallback for Cloudflare-protected pages. Includes Reddit JSON endpoint handling and PDF support.
-requirements: httpx, beautifulsoup4, lxml, pypdf
+requirements: httpx, beautifulsoup4, lxml
 """
 
 import asyncio
-import io
 import json
 import re
 from typing import Any, Awaitable, Callable, Optional
@@ -329,25 +328,20 @@ def _structured_from_html(html: str, url: str) -> dict:
     return result
 
 
-def _pdf_to_text(data: bytes) -> str:
-    """Extract text from a PDF byte stream using pypdf."""
+def _pdf_to_text(data: bytes, tika_url: str) -> str:
+    """Extract text from a PDF byte stream via Apache Tika."""
     try:
-        from pypdf import PdfReader  # lazy import; declared in requirements
+        resp = httpx.put(
+            f"{tika_url.rstrip('/')}/tika",
+            content=data,
+            headers={"Content-Type": "application/pdf", "Accept": "text/plain"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        text = resp.text.strip()
+        return text if text else "[PDF contained no extractable text]"
     except Exception as e:
-        return f"[PDF extraction failed: pypdf not available: {e}]"
-    try:
-        reader = PdfReader(io.BytesIO(data))
-        parts = []
-        for i, page in enumerate(reader.pages):
-            try:
-                t = page.extract_text() or ""
-            except Exception as pe:
-                t = f"[Page {i + 1} extraction error: {pe}]"
-            if t.strip():
-                parts.append(f"--- Page {i + 1} ---\n{t.strip()}")
-        return "\n\n".join(parts) if parts else "[PDF contained no extractable text]"
-    except Exception as e:
-        return f"[Failed to parse PDF: {e}]"
+        return f"[PDF extraction failed: {e}]"
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +652,12 @@ class Tools:
             description="maxTimeout passed to FlareSolverr, in milliseconds.",
         )
 
+        # Tika
+        TIKA_URL: str = Field(
+            default="http://tika:9998",
+            description="Base URL of your Apache Tika server used for PDF text extraction.",
+        )
+
         # HTTP
         HTTP_TIMEOUT_SECONDS: float = Field(
             default=25.0,
@@ -925,7 +925,7 @@ class Tools:
                     {"error": "PDF returned no content", "url": fetch_url, "status": status}
                 )
             await _emit_status(__event_emitter__, "Extracting PDF text...")
-            extracted = _pdf_to_text(body)
+            extracted = _pdf_to_text(body, v.TIKA_URL)
             extracted = _trim(extracted, v.MAX_PAGE_CHARS)
             await self._maybe_emit_citation(
                 __event_emitter__, fetch_url, f"PDF: {fetch_url}", extracted
