@@ -1,14 +1,17 @@
 """
 title: Deep Research
 author: mdelponte
-version: 1.3.0
+version: 1.5.0
 license: MIT
 description: >
     A deep research pipe that takes a user query, generates a research plan
     using an LLM, presents it for user confirmation, then iteratively
     searches the web via SearXNG, fetches and extracts page content, and
-    synthesizes a final structured report.  Supports FlareSolverr for
-    bypassing captchas.
+    synthesizes a final structured report.  Fetching mirrors the companion
+    fetch_page MCP tool's resilient ladder: Apache Tika for PDF/Office/
+    OpenDocument/RTF/EPUB documents, bot-wall/CAPTCHA/429 detection that
+    re-renders through FlareSolverr, a Wayback Machine fallback for pages
+    that stay blocked or render empty, and YouTube transcript extraction.
 required_open_webui_version: 0.9.0
 """
 
@@ -17,6 +20,7 @@ import json
 import logging
 import re
 import time
+from urllib.parse import urlparse, urlunparse, parse_qs, parse_qsl, urlencode
 from typing import (
     Any,
     Awaitable,
@@ -33,6 +37,19 @@ from pydantic import BaseModel, Field
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.misc import pop_system_message, get_last_user_message
 from open_webui.models.users import Users
+
+# YouTube transcript support is optional: a research run may surface a YouTube
+# video URL whose real content is the spoken transcript, not the scrapeable
+# watch page. If the open-source `youtube-transcript-api` library (>= 1.0) is
+# installed in the Open WebUI environment we use it; if not, the pipe logs once
+# and falls back to a normal HTML fetch, so this stays a zero-config optional.
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    _YT_AVAILABLE = True
+except Exception:  # pragma: no cover - import guard
+    YouTubeTranscriptApi = None  # type: ignore
+    _YT_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -62,6 +79,173 @@ log = _setup_logger()
 # assistant messages and bail out immediately rather than starting a
 # second research run.
 _DONE_MARKER = "\n\n---DEEP-RESEARCH-COMPLETE---"
+
+
+# ---------------------------------------------------------------------------
+# Fetch infrastructure constants (ported from the fetch_page MCP tool)
+# ---------------------------------------------------------------------------
+
+# Bot-wall / CAPTCHA detection. A challenge page is what should route a fetch to
+# FlareSolverr (a real browser) instead of being returned as if it were content.
+# Cloudflare is the common case but not the only one: PerimeterX/HUMAN, DataDome,
+# and Akamai Bot Manager all serve a 403 (sometimes a 200) whose body is a
+# JS/CAPTCHA challenge with none of the Cloudflare markers, so they're matched
+# explicitly or the fallback never fires.
+BLOCK_STATUS_CODES = {403, 503, 520, 521, 522, 523, 524, 525, 526, 527}
+CLOUDFLARE_MARKERS = (
+    "cf-ray",
+    "cf-chl",
+    "just a moment",
+    "attention required",
+    "cf-browser-verification",
+    "cf_chl_opt",
+    "challenge-platform",
+    "please enable cookies",
+    "/cdn-cgi/challenge-platform",
+)
+CHALLENGE_MARKERS = (
+    "px-cloud.net",
+    "/captcha/captcha.js",
+    "px-captcha",
+    "perimeterx",
+    "_pxhd",
+    "datadome",
+    "geo.captcha-delivery.com",
+    "ak_bmsc",
+    "/_sec/cp_challenge",
+    "access to this page has been denied",
+    "confirm you are a human",
+    "and not a bot",
+)
+ALL_BLOCK_MARKERS = CLOUDFLARE_MARKERS + CHALLENGE_MARKERS
+
+# Document types Apache Tika can extract that are NOT served as text/html. Tika
+# auto-detects the format from the bytes, so any of these is routed to it rather
+# than treated as HTML.
+TIKA_DOCUMENT_CTYPES = (
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument",  # docx/xlsx/pptx (prefix)
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.oasis.opendocument",  # odt/ods/odp (prefix)
+    "application/rtf",
+    "text/rtf",
+    "application/epub+zip",
+)
+TIKA_DOCUMENT_EXTENSIONS = (
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".odt",
+    ".ods",
+    ".odp",
+    ".rtf",
+    ".epub",
+)
+
+# Wayback Machine availability endpoint (no API key / local service needed).
+WAYBACK_AVAILABILITY_API = "https://archive.org/wayback/available"
+
+# A run of two or more letters — i.e. an actual word. A rendered body without
+# even one has no readable text and is an empty shell, even when not strictly
+# whitespace: a partly-rendered JS page can leave stray punctuation like "; ;"
+# that defeats a bare `.strip()` test.
+_WORD_RE = re.compile(r"[^\W\d_]{2,}")
+
+# An 11-character YouTube video ID.
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# Query-string parameters that are tracking/analytics noise rather than content
+# selectors. Stripped when building a URL's dedup key so the same article linked
+# with different campaign tags collapses to one. Anything starting with "utm_"
+# is also dropped (handled in code).
+_TRACKING_PARAMS = frozenset(
+    {
+        "fbclid",
+        "gclid",
+        "dclid",
+        "gbraid",
+        "wbraid",
+        "msclkid",
+        "mc_cid",
+        "mc_eid",
+        "igshid",
+        "ref",
+        "ref_src",
+        "ref_url",
+        "spm",
+        "yclid",
+        "_hsenc",
+        "_hsmi",
+    }
+)
+
+
+def _extract_json(raw: str) -> Any:
+    """Best-effort parse of a JSON object/array from an LLM reply.
+
+    Models often wrap JSON in ``` fences or surround it with a sentence of
+    prose, which breaks a bare ``json.loads``. This strips fences, tries a
+    direct parse, then falls back to the outermost ``{...}`` / ``[...]`` span.
+    Returns the parsed value, or ``None`` when nothing parseable is found.
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    s = re.sub(r"\s*```$", "", s).strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = s.find(open_ch)
+        end = s.rfind(close_ch)
+        if start != -1 and end > start:
+            try:
+                return json.loads(s[start : end + 1])
+            except Exception:
+                continue
+    return None
+
+
+def _dedup_key(url: str) -> str:
+    """Normalize `url` into a key for de-duplication (NOT for fetching).
+
+    Collapses scheme (http/https treated alike), a leading ``www.``, the
+    default port, a trailing slash, and tracking query params so the same
+    article reached via cosmetically different URLs is only fetched/stored once.
+    Falls back to the stripped original if parsing fails.
+    """
+    raw = (url or "").strip()
+    try:
+        p = urlparse(raw)
+    except Exception:
+        return raw
+    if not p.scheme or not p.hostname:
+        return raw.lower()
+    host = p.hostname.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    netloc = host
+    if p.port and p.port not in (80, 443):
+        netloc = f"{host}:{p.port}"
+    path = p.path or "/"
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    kept = [
+        (k, v)
+        for k, v in parse_qsl(p.query, keep_blank_values=True)
+        if k.lower() not in _TRACKING_PARAMS and not k.lower().startswith("utm_")
+    ]
+    query = urlencode(sorted(kept))
+    # Scheme normalized to https so http/https variants share a key.
+    return urlunparse(("https", netloc, path, "", query, ""))
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +334,13 @@ class Pipe:
             default=3,
             description="Search queries per cycle.",
         )
+        CYCLE_DELAY_SECONDS: float = Field(
+            default=0.0,
+            description=(
+                "Seconds to pause between research cycles. Raise (e.g. 2-5) if "
+                "SearXNG or source sites rate-limit you. 0 = no delay."
+            ),
+        )
 
         # --- Report length control ---
         SECTION_MIN_WORDS: int = Field(
@@ -173,6 +364,23 @@ class Pipe:
                 "Increase if the report is being truncated."
             ),
         )
+        REPORT_SOURCE_MAX_CHARS: int = Field(
+            default=2000,
+            description=(
+                "Max characters of each source's text included in the report "
+                "prompt. 0 = no per-source cap."
+            ),
+        )
+        REPORT_CONTEXT_MAX_CHARS: int = Field(
+            default=60000,
+            description=(
+                "Total character budget for all source text in the report "
+                "prompt. Sources past the budget are dropped from BOTH the data "
+                "and the citation list (so the model never cites a source it "
+                "couldn't see). Raise for fuller reports on long-context models; "
+                "0 = unbounded."
+            ),
+        )
 
         # --- Fetch settings ---
         PAGE_FETCH_TIMEOUT: int = Field(
@@ -183,11 +391,28 @@ class Pipe:
             default=5,
             description="Max pages to fetch concurrently.",
         )
+        VERIFY_SSL: bool = Field(
+            default=True,
+            description=(
+                "Verify TLS certificates when fetching pages. Leave on; disable "
+                "only if you must fetch sources with broken/self-signed certs."
+            ),
+        )
 
         # --- Behaviour ---
         SKIP_PLAN_CONFIRMATION: bool = Field(
             default=False,
             description="Skip the user-confirmation step for the plan.",
+        )
+        WAYBACK_FALLBACK: bool = Field(
+            default=True,
+            description=(
+                "When True, a page that stays blocked (bot wall / 429) or "
+                "renders empty after the direct fetch and FlareSolverr is "
+                "retried from the Internet Archive's Wayback Machine. "
+                "Recovered text is clearly flagged as a possibly-stale archived "
+                "snapshot. Needs no extra service (public archive.org API)."
+            ),
         )
 
     # -----------------------------------------------------------------------
@@ -221,52 +446,64 @@ class Pipe:
         }
         try:
             response = await generate_chat_completion(request, payload, user=user)
-            if isinstance(response, dict):
-                return (
-                    response.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
-            if hasattr(response, "body_iterator"):
-                full = ""
-                async for chunk in response.body_iterator:
-                    if isinstance(chunk, bytes):
-                        chunk = chunk.decode("utf-8")
-                    for line in chunk.strip().split("\n"):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if line.startswith("data: "):
-                            if line == "data: [DONE]":
-                                continue
-                            try:
-                                data = json.loads(line[6:])
-                                delta = (
-                                    data.get("choices", [{}])[0]
-                                    .get("delta", {})
-                                    .get("content", "")
-                                )
-                                full += delta
-                            except json.JSONDecodeError:
-                                pass
-                        else:
-                            try:
-                                data = json.loads(line)
-                                c = (
-                                    data.get("choices", [{}])[0]
-                                    .get("message", {})
-                                    .get("content", "")
-                                )
-                                if c:
-                                    full += c
-                            except json.JSONDecodeError:
-                                pass
-                return full.strip()
-            return str(response).strip()
+            return await self._read_completion(response)
         except Exception as e:
             log.error(f"LLM call failed: {e}")
             raise
+
+    @staticmethod
+    async def _read_completion(response: Any) -> str:
+        """Extract the assistant text from an Open WebUI chat-completion response.
+
+        Handles all three shapes ``generate_chat_completion`` can return — a
+        plain dict, a streamed ``body_iterator`` (SSE ``data:`` deltas or raw
+        JSON lines), or a stringifiable object — and returns the joined content,
+        stripped. Shared by ``_llm_call`` and the background-task branch of
+        ``pipe`` so the streaming parse lives in one place.
+        """
+        if isinstance(response, dict):
+            return (
+                response.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                or ""
+            ).strip()
+        if hasattr(response, "body_iterator"):
+            full = ""
+            async for chunk in response.body_iterator:
+                if isinstance(chunk, bytes):
+                    chunk = chunk.decode("utf-8")
+                for line in chunk.strip().split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        if line == "data: [DONE]":
+                            continue
+                        try:
+                            data = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            continue
+                        full += (
+                            data.get("choices", [{}])[0]
+                            .get("delta", {})
+                            .get("content", "")
+                            or ""
+                        )
+                    else:
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        c = (
+                            data.get("choices", [{}])[0]
+                            .get("message", {})
+                            .get("content", "")
+                        )
+                        if c:
+                            full += c
+            return full.strip()
+        return str(response).strip()
 
     # -----------------------------------------------------------------------
     # Event helpers
@@ -285,60 +522,190 @@ class Pipe:
             await emitter({"type": "replace", "data": {"content": content}})
 
     async def _emit_citation(self, emitter, url: str, title: str, snippet: str):
-        # citations will be included in the report text instead
-        pass
+        """Emit a native Open WebUI citation event so the source renders as a
+        clickable chip beneath the message (in addition to the inline ``[n]``
+        list in the report text)."""
+        if not emitter or not url:
+            return
+        await emitter(
+            {
+                "type": "citation",
+                "data": {
+                    "document": [snippet or ""],
+                    "metadata": [{"source": url}],
+                    "source": {"name": title or url, "url": url},
+                },
+            }
+        )
 
     # -----------------------------------------------------------------------
     # Web fetching
     # -----------------------------------------------------------------------
+    _BROWSER_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,*/*;q=0.8"
+        ),
+    }
+
+    def _trim_words(self, text: str) -> str:
+        """Cap a snippet to SNIPPET_MAX_WORDS words to protect the LLM context."""
+        words = text.split()
+        if len(words) > self.valves.SNIPPET_MAX_WORDS:
+            return " ".join(words[: self.valves.SNIPPET_MAX_WORDS]) + " [...]"
+        return text
+
+    @staticmethod
+    def _is_tika_document(ctype: str, url: str) -> bool:
+        """True if the response looks like a binary document Tika should extract."""
+        ctype = (ctype or "").lower()
+        if any(ctype.startswith(c) for c in TIKA_DOCUMENT_CTYPES):
+            return True
+        # Fall back on the URL path when the server sends a generic content-type
+        # (e.g. application/octet-stream) but the extension is telling.
+        try:
+            path = (urlparse(url).path or "").lower()
+        except Exception:
+            return False
+        return path.endswith(TIKA_DOCUMENT_EXTENSIONS)
+
+    @staticmethod
+    def _is_contentless(body: str) -> bool:
+        """True if `body` has no readable text (not one word of 2+ letters)."""
+        return not _WORD_RE.search(body or "")
+
+    @staticmethod
+    def _is_blocked_response(status: int, text: str, headers: Dict) -> bool:
+        """Best-effort detection that a response is a bot wall / CAPTCHA / throttle.
+
+        Covers Cloudflare plus PerimeterX/HUMAN, DataDome, and Akamai Bot Manager
+        — each of which serves a challenge under one of ``BLOCK_STATUS_CODES`` (or
+        a bare 200) carrying its own marker rather than the page's real content —
+        and any HTTP 429, which is definitionally a throttle and never real data.
+        """
+        # 429 is always a rate-limit/throttle and never carries real content; a
+        # real browser (FlareSolverr) often clears it, so treat it as a block.
+        if status == 429:
+            return True
+        hdr_lower = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
+        server = hdr_lower.get("server", "")
+        set_cookie = hdr_lower.get("set-cookie", "")
+        if "cloudflare" in server and status in BLOCK_STATUS_CODES:
+            return True
+        if status in BLOCK_STATUS_CODES:
+            if (
+                "x-datadome" in hdr_lower
+                or "datadome" in set_cookie
+                or "_px" in set_cookie
+            ):
+                return True
+            t = (text or "")[:8000].lower()
+            if any(m in t for m in ALL_BLOCK_MARKERS):
+                return True
+        if status == 200 and text:
+            t = text[:4000].lower()
+            if sum(1 for m in ALL_BLOCK_MARKERS if m in t) >= 2:
+                return True
+        return False
+
     async def _fetch_page(
         self, session: aiohttp.ClientSession, url: str
     ) -> Tuple[str, str]:
-        # Reddit links are typically served behind anti-bot measures that
-        # break plain HTML scraping. Route them through Reddit's public
-        # JSON endpoint instead (just append .json to the URL).
+        """Fetch one URL's readable text through a resilient fallback ladder.
+
+        Returns ``(url, text)``; ``text`` is empty when nothing usable could be
+        recovered (the research loop skips snippets under ~20 words). The ladder:
+        Reddit JSON → YouTube transcript → direct GET (document→Tika), and on a
+        bot wall / 429 / empty JS shell, FlareSolverr and then the Wayback
+        Machine. A challenge page we can't get past is returned as empty rather
+        than as if it were content.
+        """
+        # Reddit serves anti-bot HTML; route through its public .json endpoint.
         if self._is_reddit_url(url):
             text = await self._fetch_reddit(session, url)
-            words = text.split()
-            if len(words) > self.valves.SNIPPET_MAX_WORDS:
-                text = " ".join(words[: self.valves.SNIPPET_MAX_WORDS]) + " [...]"
-            return url, text
+            return url, self._trim_words(text)
 
-        text = ""
+        # A YouTube video's real content is its transcript, not the watch page.
+        if _YT_AVAILABLE and self._is_youtube_video_url(url):
+            transcript = await self._fetch_youtube_transcript(url)
+            if transcript:
+                return url, self._trim_words(transcript)
+            # No captions / blocked IP — fall through to a normal HTML fetch.
+
+        status = 0
+        headers: Dict[str, str] = {}
+        raw_html = ""
+        is_doc = False
+        body_bytes = b""
         try:
             async with session.get(
                 url,
                 timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": (
-                        "text/html,application/xhtml+xml,"
-                        "application/xml;q=0.9,*/*;q=0.8"
-                    ),
-                },
+                headers=self._BROWSER_HEADERS,
                 allow_redirects=True,
-                ssl=False,
+                ssl=self.valves.VERIFY_SSL,
             ) as resp:
-                if resp.status == 200:
-                    ct = resp.headers.get("Content-Type", "")
-                    if "pdf" in ct.lower():
-                        text = await self._extract_pdf(await resp.read())
-                    else:
-                        text = self._html_to_text(await resp.text(errors="replace"))
+                status = resp.status
+                headers = dict(resp.headers)
+                ct = resp.headers.get("Content-Type", "")
+                # Route binary documents (PDF/Office/OpenDocument/RTF/EPUB) to
+                # Tika regardless of status code; everything else is read as text
+                # so block detection can inspect the body.
+                if self._is_tika_document(ct, url):
+                    body_bytes = await resp.read()
+                    is_doc = True
+                else:
+                    raw_html = await resp.text(errors="replace")
         except Exception as e:
             log.debug(f"Direct fetch failed for {url}: {e}")
 
-        if not text.strip() and self.valves.FLARESOLVERR_URL:
-            text = await self._flaresolverr(session, url)
+        if is_doc:
+            extracted = await self._extract_document(body_bytes)
+            return url, self._trim_words(extracted)
 
-        words = text.split()
-        if len(words) > self.valves.SNIPPET_MAX_WORDS:
-            text = " ".join(words[: self.valves.SNIPPET_MAX_WORDS]) + " [...]"
-        return url, text
+        blocked = self._is_blocked_response(status, raw_html, headers) if status else False
+        rendered_text = self._html_to_text(raw_html) if raw_html else ""
+        # A bot wall, a throttle, or a 200 that rendered to no readable text (a
+        # client-side-rendered SPA whose body loads via XHR) all need a real
+        # browser or an archive to recover.
+        need_fallback = blocked or self._is_contentless(rendered_text)
+
+        # Tier 1: FlareSolverr renders the page's JS in a real browser.
+        if need_fallback and self.valves.FLARESOLVERR_URL:
+            fs_html, fs_status, fs_headers = await self._flaresolverr(session, url)
+            if fs_html:
+                fs_blocked = self._is_blocked_response(
+                    fs_status or 200, fs_html, fs_headers
+                )
+                fs_text = self._html_to_text(fs_html)
+                if fs_text and not fs_blocked and not self._is_contentless(fs_text):
+                    return url, self._trim_words(fs_text)
+                # FlareSolverr returning a page isn't a bypass — an interactive
+                # wall (PerimeterX "Press & Hold", a CAPTCHA) renders as an
+                # ordinary page it can't solve. Keep the block flag and try the
+                # archive next.
+                blocked = blocked or fs_blocked
+
+        # Tier 2: a Wayback snapshot may hold text the live page now hides/blocks.
+        if need_fallback and self.valves.WAYBACK_FALLBACK:
+            archived = await self._fetch_from_wayback(session, url)
+            if archived:
+                wb_text, wb_date = archived
+                note = (
+                    f"[Archived snapshot from {wb_date} via the Wayback Machine; "
+                    "the live page was unavailable, so this may be out of date.]\n"
+                )
+                return url, note + self._trim_words(wb_text)
+
+        # Don't surface an unbypassed challenge page as if it were content.
+        if blocked:
+            return url, ""
+        return url, self._trim_words(rendered_text)
 
     # -----------------------------------------------------------------------
     # Reddit JSON endpoint handling
@@ -396,7 +763,7 @@ class Pipe:
                     "Accept": "application/json",
                 },
                 allow_redirects=True,
-                ssl=False,
+                ssl=self.valves.VERIFY_SSL,
             ) as resp:
                 if resp.status != 200:
                     log.debug(
@@ -527,7 +894,17 @@ class Pipe:
 
         return "\n".join(parts).strip()
 
-    async def _flaresolverr(self, session: aiohttp.ClientSession, url: str) -> str:
+    async def _flaresolverr(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> Tuple[str, int, Dict]:
+        """Render `url` through FlareSolverr (a real browser that runs the page's
+        JS and clears Cloudflare-style walls).
+
+        Returns ``(html, status, headers)`` from the solved page so the caller
+        can re-run block detection on what FlareSolverr actually got — a page it
+        returns may still be an interactive challenge it couldn't solve.
+        ``("", 0, {})`` on any failure.
+        """
         try:
             async with session.post(
                 self.valves.FLARESOLVERR_URL,
@@ -542,12 +919,14 @@ class Pipe:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    html = data.get("solution", {}).get("response", "")
-                    if html:
-                        return self._html_to_text(html)
+                    sol = data.get("solution", {}) or {}
+                    html = sol.get("response", "") or ""
+                    fs_status = int(sol.get("status") or 0)
+                    fs_headers = sol.get("headers") or {}
+                    return html, fs_status, fs_headers
         except Exception as e:
             log.debug(f"FlareSolverr failed for {url}: {e}")
-        return ""
+        return "", 0, {}
 
     @staticmethod
     def _html_to_text(html: str) -> str:
@@ -569,21 +948,174 @@ class Pipe:
             text = text.replace(ent, ch)
         return re.sub(r"\s+", " ", text).strip()
 
-    async def _extract_pdf(self, data: bytes) -> str:
+    async def _extract_document(self, data: bytes) -> str:
+        """Extract plain text from a document byte stream via Apache Tika.
+
+        No Content-Type is sent: Tika auto-detects the format from the bytes, so
+        this one path handles PDF, Office (doc/docx/xls/xlsx/ppt/pptx),
+        OpenDocument, RTF and EPUB. ``X-Tika-PDFOcrStrategy: no_ocr`` keeps it to
+        embedded text (fast; avoids OCR of image-heavy PDFs blowing the timeout).
+        """
+        if not data:
+            return "[Document returned no content]"
         try:
             tika_url = f"{self.valves.TIKA_URL.rstrip('/')}/tika"
             async with aiohttp.ClientSession() as session:
                 async with session.put(
                     tika_url,
                     data=data,
-                    headers={"Content-Type": "application/pdf", "Accept": "text/plain"},
-                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers={
+                        "Accept": "text/plain",
+                        "X-Tika-PDFOcrStrategy": "no_ocr",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=60),
                 ) as resp:
                     resp.raise_for_status()
                     text = (await resp.text()).strip()
-                    return text if text else "[PDF contained no extractable text]"
+                    return text if text else "[Document contained no extractable text]"
         except Exception as e:
-            return f"[PDF extraction failed: {e}]"
+            return f"[Document extraction failed: {e}]"
+
+    # -----------------------------------------------------------------------
+    # Wayback Machine (archive.org) fallback
+    # -----------------------------------------------------------------------
+    async def _fetch_from_wayback(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> Optional[Tuple[str, str]]:
+        """Recover readable text for `url` from the Internet Archive, or None.
+
+        A last resort when the live page (even after a FlareSolverr render) is
+        blocked or yields no readable text: a prior snapshot may have captured
+        text the live SPA now hides behind JS, or the page may since have
+        changed/disappeared. Returns ``(text, YYYY-MM-DD)`` for the closest
+        available 200 snapshot, or ``None``. Best-effort — any error returns
+        ``None`` since this only runs after the live attempts already failed.
+
+        The snapshot is requested in ``id_`` (identity) mode, which returns the
+        original archived HTML without the Wayback toolbar/URL-rewriting, so the
+        existing text extraction handles it like a live page.
+        """
+        now = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+        try:
+            async with session.get(
+                WAYBACK_AVAILABILITY_API,
+                params={"url": url, "timestamp": now},
+                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            log.debug(f"Wayback availability lookup failed for {url}: {e}")
+            return None
+
+        snap = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
+        ts = snap.get("timestamp") or ""
+        # Accept only an available snapshot that was a 200 capture; some omit
+        # `status`, which we tolerate.
+        if not snap.get("available") or not ts:
+            return None
+        if str(snap.get("status") or "200") != "200":
+            return None
+
+        snapshot_url = f"https://web.archive.org/web/{ts}id_/{url}"
+        try:
+            async with session.get(
+                snapshot_url,
+                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
+                headers=self._BROWSER_HEADERS,
+                allow_redirects=True,
+                ssl=self.valves.VERIFY_SSL,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                ct = resp.headers.get("Content-Type", "")
+                if self._is_tika_document(ct, url):
+                    text = await self._extract_document(await resp.read())
+                else:
+                    text = self._html_to_text(await resp.text(errors="replace"))
+        except Exception as e:
+            log.debug(f"Wayback snapshot fetch failed for {snapshot_url}: {e}")
+            return None
+
+        if self._is_contentless(text):
+            return None
+        date = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 and ts[:8].isdigit() else ts
+        return text, date
+
+    # -----------------------------------------------------------------------
+    # YouTube transcript handling (optional dependency)
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _extract_video_id(url_or_id: str) -> str:
+        """Extract an 11-char YouTube video ID from a URL, or pass a bare ID through."""
+        s = (url_or_id or "").strip()
+        if not s:
+            raise ValueError("No URL or video ID provided.")
+        if _VIDEO_ID_RE.match(s):
+            return s
+        if not s.startswith(("http://", "https://")):
+            s = "https://" + s
+        parsed = urlparse(s)
+        host = (parsed.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = parsed.path or ""
+        if host == "youtu.be":
+            candidate = path.lstrip("/").split("/")[0]
+            if _VIDEO_ID_RE.match(candidate):
+                return candidate
+        if host.endswith("youtube.com") or host == "youtube-nocookie.com":
+            qs = parse_qs(parsed.query)
+            if qs.get("v"):
+                candidate = qs["v"][0]
+                if _VIDEO_ID_RE.match(candidate):
+                    return candidate
+            m = re.match(r"^/(?:shorts|embed|live|v)/([A-Za-z0-9_-]{11})", path)
+            if m:
+                return m.group(1)
+        raise ValueError(f"Could not extract a YouTube video ID from: {url_or_id!r}")
+
+    @classmethod
+    def _is_youtube_video_url(cls, url: str) -> bool:
+        """True only for a YouTube URL we can pull a video ID out of (watch,
+        youtu.be, /shorts/, /embed/, /live/) — not channels/playlists/home."""
+        s = (url or "").strip()
+        if not s.startswith(("http://", "https://")):
+            return False
+        try:
+            cls._extract_video_id(s)
+            return True
+        except ValueError:
+            return False
+
+    async def _fetch_youtube_transcript(self, url: str) -> str:
+        """Return a YouTube video's transcript as plain text, or "" on any failure.
+
+        Uses the optional `youtube-transcript-api` (>= 1.0); the blocking call is
+        offloaded to a thread. Empty string on no captions, a blocked IP, an
+        unavailable video, etc., so the caller falls back to a normal HTML fetch.
+        """
+        if not _YT_AVAILABLE:
+            return ""
+        try:
+            video_id = self._extract_video_id(url)
+        except ValueError:
+            return ""
+
+        def _work() -> str:
+            snippets = list(YouTubeTranscriptApi().fetch(video_id))
+            lines = [
+                (snip.text or "").replace("\n", " ").strip() for snip in snippets
+            ]
+            body = " ".join(ln for ln in lines if ln)
+            return f"YouTube transcript ({video_id}): {body}" if body else ""
+
+        try:
+            return await asyncio.to_thread(_work)
+        except Exception as e:
+            log.debug(f"YouTube transcript failed for {url}: {e}")
+            return ""
 
     # -----------------------------------------------------------------------
     # SearXNG
@@ -680,12 +1212,8 @@ Guidelines:
             user,
             temperature=0.4,
         )
-        raw = re.sub(r"```(?:json)?\s*", "", raw)
-        raw = re.sub(r"```\s*$", "", raw).strip()
-
-        try:
-            plan = json.loads(raw)
-        except json.JSONDecodeError:
+        plan = _extract_json(raw)
+        if not isinstance(plan, dict):
             plan = {
                 "plan_summary": f"Research plan for: {query}",
                 "sections": [
@@ -761,14 +1289,19 @@ Guidelines:
             elif not cqs:
                 break
 
-            # Search
+            # Search. De-dup on a normalized key so the same article reached via
+            # http/https, www., trailing-slash, or tracking-param variants is
+            # only fetched once.
             results: List[Dict[str, str]] = []
             for cq in cqs:
                 await self._emit_status(emitter, f"🔍 Searching: {cq[:80]}…")
                 for r in await self._search(session, cq):
-                    if r["url"] and r["url"] not in seen_urls:
+                    if not r["url"]:
+                        continue
+                    key = _dedup_key(r["url"])
+                    if key not in seen_urls:
                         results.append(r)
-                        seen_urls.add(r["url"])
+                        seen_urls.add(key)
 
             if not results:
                 if cycle >= self.valves.MIN_RESEARCH_CYCLES:
@@ -830,6 +1363,13 @@ Guidelines:
                     )
                     break
 
+            # Optional politeness pause before the next cycle's searches/fetches.
+            if (
+                self.valves.CYCLE_DELAY_SECONDS > 0
+                and cycle < self.valves.MAX_RESEARCH_CYCLES
+            ):
+                await asyncio.sleep(self.valves.CYCLE_DELAY_SECONDS)
+
         return collected, source_urls
 
     async def _followup_queries(
@@ -855,14 +1395,9 @@ Guidelines:
             user,
             temperature=0.5,
         )
-        raw = re.sub(r"```(?:json)?\s*", "", raw)
-        raw = re.sub(r"```\s*$", "", raw).strip()
-        try:
-            qs = json.loads(raw)
-            if isinstance(qs, list):
-                return [str(q) for q in qs[: self.valves.QUERIES_PER_CYCLE]]
-        except json.JSONDecodeError:
-            pass
+        qs = _extract_json(raw)
+        if isinstance(qs, list):
+            return [str(q) for q in qs[: self.valves.QUERIES_PER_CYCLE]]
         return [f"{query} additional information"]
 
     async def _should_continue(
@@ -920,11 +1455,20 @@ Guidelines:
             temperature=0.2,
             max_tokens=3000,
         )
+        # Preserve the real URLs the summary folds together so the report's
+        # citation list can still name them (the per-source content is gone, but
+        # the attribution shouldn't be).
+        covered = [
+            s["url"]
+            for s in old
+            if s.get("url") and s["url"] != "compressed_summary"
+        ]
         return [
             {
                 "url": "compressed_summary",
                 "title": f"Summary of {len(old)} earlier sources",
                 "content": summary,
+                "source_urls": covered,
             }
         ] + recent
 
@@ -943,19 +1487,59 @@ Guidelines:
     ) -> str:
         await self._emit_status(emitter, "📝 Writing final report…")
 
-        ctx = ""
-        for i, s in enumerate(collected):
-            ctx += (
-                f"\n--- SOURCE {i+1}: {s['title']} "
-                f"({s['url']}) ---\n"
-                f"{s['content'][:1500]}\n"
+        # Build the source blocks and the [n] citation list from ONE numbering so
+        # "SOURCE n" in the data, "[n]" in the text, and the reference list always
+        # agree. Sources are added until the character budget is hit; any past it
+        # are dropped from BOTH the data and the references, so the model can
+        # never cite a source it wasn't actually shown. (`source_urls` — the full
+        # running list — is still used for the progress snapshot, not here.)
+        source_cap = self.valves.REPORT_SOURCE_MAX_CHARS
+        ctx_budget = self.valves.REPORT_CONTEXT_MAX_CHARS
+
+        blocks: List[str] = []
+        ref_lines: List[str] = []
+        used_chars = 0
+        n = 0
+        for s in collected:
+            content = s.get("content") or ""
+            if source_cap > 0:
+                content = content[:source_cap]
+            idx = n + 1
+            block = (
+                f"\n--- SOURCE {idx}: {s.get('title') or s.get('url')} "
+                f"({s.get('url')}) ---\n{content}\n"
+            )
+            # Stop once the budget is exhausted, but always keep at least one.
+            if ctx_budget > 0 and n > 0 and used_chars + len(block) > ctx_budget:
+                break
+            blocks.append(block)
+            used_chars += len(block)
+            n = idx
+            if s.get("url") == "compressed_summary":
+                covered = s.get("source_urls") or []
+                if covered:
+                    ref_lines.append(
+                        f"[{idx}] Summary of earlier sources: " + "; ".join(covered)
+                    )
+                else:
+                    ref_lines.append(f"[{idx}] Summary of earlier sources")
+            else:
+                ref_lines.append(f"[{idx}] {s.get('url')}")
+
+        ctx = "".join(blocks)
+        refs = "\n".join(ref_lines)
+        dropped = len(collected) - n
+        if dropped > 0:
+            log.info(
+                "Report context budget reached: included %d of %d sources",
+                n,
+                len(collected),
             )
 
         secs = "\n".join(
             f"- {s['title']}: {s.get('description','')}"
             for s in plan.get("sections", [])
         )
-        refs = "\n".join(f"[{i+1}] {u}" for i, u in enumerate(source_urls))
 
         smin = self.valves.SECTION_MIN_WORDS
         smax = self.valves.SECTION_MAX_WORDS
@@ -968,7 +1552,7 @@ Guidelines:
 {secs}
 
 **Research Data:**
-{ctx[:30000]}
+{ctx}
 
 **Available Sources (for citation):**
 {refs}
@@ -1088,32 +1672,7 @@ GUIDELINES:
                 response = await generate_chat_completion(
                     __request__, payload, user=user_obj
                 )
-                if isinstance(response, dict):
-                    return (
-                        response.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "Deep Research")
-                    )
-                if hasattr(response, "body_iterator"):
-                    full = ""
-                    async for chunk in response.body_iterator:
-                        if isinstance(chunk, bytes):
-                            chunk = chunk.decode("utf-8")
-                        for line in chunk.strip().split("\n"):
-                            line = line.strip()
-                            if line.startswith("data: ") and line != "data: [DONE]":
-                                try:
-                                    data = json.loads(line[6:])
-                                    delta = (
-                                        data.get("choices", [{}])[0]
-                                        .get("delta", {})
-                                        .get("content", "")
-                                    )
-                                    full += delta
-                                except json.JSONDecodeError:
-                                    pass
-                    return full.strip() or "Deep Research"
-                return str(response).strip() or "Deep Research"
+                return await self._read_completion(response) or "Deep Research"
             except Exception as e:
                 log.warning(f"Task forwarding failed: {e}")
                 return "Deep Research"
@@ -1220,11 +1779,10 @@ GUIDELINES:
                             user_obj,
                             temperature=0.4,
                         )
-                        mod = re.sub(r"```(?:json)?\s*", "", mod)
-                        mod = re.sub(r"```\s*$", "", mod).strip()
-                        try:
-                            plan = json.loads(mod)
-                        except json.JSONDecodeError:
+                        modified = _extract_json(mod)
+                        if isinstance(modified, dict):
+                            plan = modified
+                        else:
                             log.warning("Modified plan parse failed")
 
                 # ======================================================
