@@ -1,13 +1,17 @@
 """
 title: Deep Research
 author: mdelponte
-version: 1.5.0
+version: 2.0.0
 license: MIT
 description: >
-    A deep research pipe that takes a user query, generates a research plan
-    using an LLM, presents it for user confirmation, then iteratively
-    searches the web via SearXNG, fetches and extracts page content, and
-    synthesizes a final structured report.  Fetching mirrors the companion
+    A deep research pipe that takes a user query, generates a research plan,
+    presents it for confirmation, then runs a section-attributed, gap-driven
+    research loop and writes a structured, citation-grounded report. Fetched
+    pages are relevance-extracted (the passages matching each query, not the
+    page head), de-duplicated, and the loop follows promising in-page links
+    (multi-hop) and biases toward recent sources when the topic is time-
+    sensitive. The report is written section by section against each section's
+    own sources under one global citation index. Fetching mirrors the companion
     fetch_page MCP tool's resilient ladder: Apache Tika for PDF/Office/
     OpenDocument/RTF/EPUB documents, bot-wall/CAPTCHA/429 detection that
     re-renders through FlareSolverr, a Wayback Machine fallback for pages
@@ -20,7 +24,14 @@ import json
 import logging
 import re
 import time
-from urllib.parse import urlparse, urlunparse, parse_qs, parse_qsl, urlencode
+from urllib.parse import (
+    urlparse,
+    urlunparse,
+    urljoin,
+    parse_qs,
+    parse_qsl,
+    urlencode,
+)
 from typing import (
     Any,
     Awaitable,
@@ -249,6 +260,172 @@ def _dedup_key(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Relevance extraction (improvement #1) and multi-hop link selection (#8)
+#
+# Instead of keeping the first N words of every page, we score the page's
+# segments against the query that surfaced it and keep the most relevant ones up
+# to the word budget. The same lexical scorer ranks candidate in-page links for
+# multi-hop following. Pure, dependency-free, and unit-testable; an optional
+# embedding ranker (when EMBEDDING_MODEL is set) layers on top in the Pipe class.
+# ---------------------------------------------------------------------------
+
+# How much of a fetched page we scan for relevant passages. Bounds memory/CPU on
+# huge pages while still giving the extractor far more to choose from than the
+# final SNIPPET_MAX_WORDS budget.
+_RELEVANCE_SCAN_MAX_WORDS = 4000
+
+# Roughly one "segment" (the unit we score) is at most this many words; longer
+# paragraphs are split into sentence-ish chunks.
+_SEGMENT_MAX_WORDS = 60
+
+# Common words carry no topical signal, so they're dropped before scoring.
+_STOPWORDS = frozenset(
+    """a an and are as at be by for from has have how in into is it its of on or
+    that the their them they this to was were what when where which who why will
+    with about over under more most other some such than then these those you your
+    we our us i""".split()
+)
+
+_WORD_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# Hrefs that are never worth following as a research source.
+_LINK_EXCLUDE_RE = re.compile(
+    r"(?:^mailto:|^tel:|^javascript:|^#)"
+    r"|(?:facebook|twitter|x|instagram|linkedin|pinterest|reddit|youtube|tiktok|"
+    r"t)\.(?:com|co)/(?:share|intent|sharer)"
+    r"|/(?:login|signin|sign-in|signup|sign-up|register|subscribe|cart|account|"
+    r"privacy|terms|cookie|advertise|contact)\b",
+    re.IGNORECASE,
+)
+
+
+def _tokenize(text: str) -> List[str]:
+    """Lowercase word tokens with stopwords removed."""
+    return [
+        t for t in _WORD_TOKEN_RE.findall((text or "").lower()) if t not in _STOPWORDS
+    ]
+
+
+def _segments(text: str) -> List[str]:
+    """Split text into scoring units (~sentences / short paragraphs).
+
+    Robust to ``_html_to_text`` collapsing a page into one long line (it splits
+    such a blob into sentences) and to documents/transcripts that keep newlines
+    (split per line first). Blank fragments are dropped.
+    """
+    out: List[str] = []
+    for para in re.split(r"\n+", text or ""):
+        para = para.strip()
+        if not para:
+            continue
+        if len(para.split()) <= _SEGMENT_MAX_WORDS:
+            out.append(para)
+            continue
+        buf = ""
+        for sent in re.split(r"(?<=[.!?])\s+", para):
+            if len((buf + " " + sent).split()) > _SEGMENT_MAX_WORDS:
+                if buf:
+                    out.append(buf.strip())
+                buf = sent
+            else:
+                buf = (buf + " " + sent).strip()
+        if buf:
+            out.append(buf.strip())
+    return out
+
+
+def _score_segment(seg_tokens: set, query_tokens: set) -> float:
+    """Fraction of distinct query tokens present in a segment (0..1)."""
+    if not query_tokens:
+        return 0.0
+    return len(seg_tokens & query_tokens) / len(query_tokens)
+
+
+def _extract_relevant(
+    text: str, query: str, max_words: int, *, scan_max: int = _RELEVANCE_SCAN_MAX_WORDS
+) -> Tuple[str, float]:
+    """Return the passages of `text` most relevant to `query`, plus a 0..1 score.
+
+    Segments are scored by query-token overlap; the highest-scoring ones are
+    reassembled in document order up to `max_words`. The score is the distinct
+    fraction of query tokens covered by the kept passages — comparable across
+    sources, so it drives retention/compression and report ordering. When nothing
+    lexically matches (e.g. a conceptual query), falls back to the head of the
+    text with score 0.0 rather than dropping a possibly-relevant page.
+    """
+    words = (text or "").split()
+    if not words:
+        return "", 0.0
+    if scan_max > 0 and len(words) > scan_max:
+        text = " ".join(words[:scan_max])
+
+    query_tokens = set(_tokenize(query))
+    segs = _segments(text)
+    if not segs or not query_tokens:
+        head = " ".join((text or "").split()[:max_words])
+        return head, 0.0
+
+    scored = [(_score_segment(set(_tokenize(s)), query_tokens), i, s) for i, s in enumerate(segs)]
+    matching = [t for t in scored if t[0] > 0]
+    if not matching:
+        head = " ".join(text.split()[:max_words])
+        return head, 0.0
+
+    # Take the best segments by score, then restore document order for readability.
+    matching.sort(key=lambda t: t[0], reverse=True)
+    chosen: List[Tuple[int, str]] = []
+    budget = 0
+    covered: set = set()
+    for score, idx, seg in matching:
+        wc = len(seg.split())
+        if max_words > 0 and budget + wc > max_words and chosen:
+            break
+        chosen.append((idx, seg))
+        budget += wc
+        covered |= set(_tokenize(seg)) & query_tokens
+        if max_words > 0 and budget >= max_words:
+            break
+
+    chosen.sort(key=lambda t: t[0])
+    passages = "\n".join(seg for _, seg in chosen)
+    score = len(covered) / len(query_tokens)
+    return passages, score
+
+
+def _select_links(
+    links: List[Tuple[str, str]], query: str, seen_keys: set, limit: int
+) -> List[str]:
+    """Pick up to `limit` in-page links worth following for multi-hop research.
+
+    Ranks candidate links by how well their anchor text matches the query,
+    skipping junk/nav/social/auth hrefs and anything already seen (by dedup key).
+    Returns absolute hrefs, best first; only links with some query overlap.
+    """
+    if limit <= 0 or not links:
+        return []
+    query_tokens = set(_tokenize(query))
+    if not query_tokens:
+        return []
+    ranked: List[Tuple[float, str]] = []
+    seen_here: set = set()
+    for anchor, href in links:
+        if not href or _LINK_EXCLUDE_RE.search(href):
+            continue
+        if not href.lower().startswith(("http://", "https://")):
+            continue
+        key = _dedup_key(href)
+        if key in seen_keys or key in seen_here:
+            continue
+        score = _score_segment(set(_tokenize(anchor)), query_tokens)
+        if score <= 0:
+            continue
+        seen_here.add(key)
+        ranked.append((score, href))
+    ranked.sort(key=lambda t: t[0], reverse=True)
+    return [href for _, href in ranked[:limit]]
+
+
+# ---------------------------------------------------------------------------
 # Pipe class
 # ---------------------------------------------------------------------------
 class Pipe:
@@ -270,8 +447,11 @@ class Pipe:
         EMBEDDING_MODEL: str = Field(
             default="",
             description=(
-                "Embedding model ID for parsing PDFs or long documents. "
-                "Leave blank to skip PDF embedding."
+                "Optional embedding model ID. Reserved hook for embedding-based "
+                "relevance ranking of page passages/sources; when set the pipe "
+                "uses it if the Open WebUI embeddings endpoint resolves and "
+                "otherwise falls back to the built-in lexical (keyword-overlap) "
+                "scorer. Blank = lexical-only (the default, no setup needed)."
             ),
         )
 
@@ -290,6 +470,14 @@ class Pipe:
                 "Comma-separated SearXNG engines "
                 "(e.g. 'google,bing,duckduckgo'). "
                 "Blank = SearXNG defaults."
+            ),
+        )
+        SEARCH_TIME_RANGE: str = Field(
+            default="",
+            description=(
+                "Recency filter applied to every search: '', 'day', 'week', "
+                "'month', or 'year'. Blank = no restriction. The research plan's "
+                "own recency hint overrides this per run."
             ),
         )
 
@@ -311,13 +499,18 @@ class Pipe:
         # --- Snippet / context control ---
         SNIPPET_MAX_WORDS: int = Field(
             default=300,
-            description="Max words kept per fetched page snippet.",
+            description=(
+                "Max words kept per source after relevance extraction — the "
+                "passages most relevant to the query are selected up to this "
+                "budget (not the first N words of the page)."
+            ),
         )
         MAX_TOTAL_CONTEXT_WORDS: int = Field(
             default=30000,
             description=(
-                "Soft cap on accumulated research context (words). "
-                "Older snippets are compressed when exceeded."
+                "Soft cap on accumulated research context (words). When "
+                "exceeded, the lowest-relevance snippets are compressed into a "
+                "summary while the highest-scored ones are kept verbatim."
             ),
         )
 
@@ -333,6 +526,22 @@ class Pipe:
         QUERIES_PER_CYCLE: int = Field(
             default=3,
             description="Search queries per cycle.",
+        )
+        MIN_SOURCES_PER_SECTION: int = Field(
+            default=2,
+            description=(
+                "Coverage target per planned section. The loop prioritises "
+                "under-covered sections and keeps researching until every "
+                "section has at least this many good sources (or cycles run out)."
+            ),
+        )
+        MAX_LINK_HOPS_PER_CYCLE: int = Field(
+            default=3,
+            description=(
+                "Multi-hop budget: how many promising links found INSIDE fetched "
+                "pages to follow each cycle (depth 1 only) to reach primary "
+                "sources beyond the search results. 0 disables link-following."
+            ),
         )
         CYCLE_DELAY_SECONDS: float = Field(
             default=0.0,
@@ -360,8 +569,18 @@ class Pipe:
         REPORT_MAX_TOKENS: int = Field(
             default=16384,
             description=(
-                "Max tokens the LLM may generate for the final report. "
-                "Increase if the report is being truncated."
+                "Max tokens the LLM may generate for the final report (per "
+                "section in sectioned mode, or for the whole report in single "
+                "mode). Increase if output is being truncated."
+            ),
+        )
+        REPORT_MODE: str = Field(
+            default="sectioned",
+            description=(
+                "'sectioned' (default) drafts each report section in its own LLM "
+                "call against only that section's sources, then a synthesis pass "
+                "writes the abstract/conclusion — more thorough, more LLM calls. "
+                "'single' writes the whole report in one call (legacy, cheaper)."
             ),
         )
         REPORT_SOURCE_MAX_CHARS: int = Field(
@@ -553,12 +772,55 @@ class Pipe:
         ),
     }
 
-    def _trim_words(self, text: str) -> str:
-        """Cap a snippet to SNIPPET_MAX_WORDS words to protect the LLM context."""
-        words = text.split()
-        if len(words) > self.valves.SNIPPET_MAX_WORDS:
-            return " ".join(words[: self.valves.SNIPPET_MAX_WORDS]) + " [...]"
+    @staticmethod
+    def _cap_words(text: str, max_words: int) -> str:
+        """Hard-cap `text` to `max_words` words (a memory/CPU bound, not the
+        relevance budget — that's applied later by `_extract_relevant`)."""
+        words = (text or "").split()
+        if max_words > 0 and len(words) > max_words:
+            return " ".join(words[:max_words])
         return text
+
+    _A_TAG_RE = re.compile(
+        r'<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    @classmethod
+    def _extract_links(cls, html: str, base_url: str) -> List[Tuple[str, str]]:
+        """Pull ``(anchor_text, absolute_href)`` pairs from page HTML.
+
+        Best-effort regex harvest (the pipe flattens HTML to text elsewhere, so
+        links would otherwise be lost). Relative hrefs are resolved against
+        `base_url`; fragments/mailto/js are skipped. Feeds multi-hop following.
+        """
+        out: List[Tuple[str, str]] = []
+        for href, inner in cls._A_TAG_RE.findall(html or ""):
+            href = href.strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+                continue
+            anchor = re.sub(r"<[^>]+>", " ", inner)
+            anchor = re.sub(r"\s+", " ", anchor).strip()
+            try:
+                abs_href = urljoin(base_url, href)
+            except Exception:
+                continue
+            if abs_href.lower().startswith(("http://", "https://")):
+                out.append((anchor, abs_href))
+        return out
+
+    @staticmethod
+    def _page(
+        url: str,
+        text: str,
+        *,
+        links: Optional[List[Tuple[str, str]]] = None,
+        kind: str = "html",
+    ) -> Dict[str, Any]:
+        """Build the raw-fetch result the research loop consumes. ``text`` is the
+        fuller readable content (relevance extraction happens later); ``links``
+        are in-page links for multi-hop; ``kind`` records how it was fetched."""
+        return {"url": url, "text": text or "", "links": links or [], "kind": kind}
 
     @staticmethod
     def _is_tika_document(ctype: str, url: str) -> bool:
@@ -615,26 +877,30 @@ class Pipe:
 
     async def _fetch_page(
         self, session: aiohttp.ClientSession, url: str
-    ) -> Tuple[str, str]:
-        """Fetch one URL's readable text through a resilient fallback ladder.
+    ) -> Dict[str, Any]:
+        """Fetch one URL through a resilient fallback ladder.
 
-        Returns ``(url, text)``; ``text`` is empty when nothing usable could be
-        recovered (the research loop skips snippets under ~20 words). The ladder:
-        Reddit JSON → YouTube transcript → direct GET (document→Tika), and on a
-        bot wall / 429 / empty JS shell, FlareSolverr and then the Wayback
-        Machine. A challenge page we can't get past is returned as empty rather
-        than as if it were content.
+        Returns a page dict ``{url, text, links, kind}`` (see `_page`); ``text``
+        is the fuller readable content (relevance extraction is applied later by
+        the loop) and is empty when nothing usable could be recovered. The
+        ladder: Reddit JSON → YouTube transcript → direct GET (document→Tika),
+        and on a bot wall / 429 / empty JS shell, FlareSolverr and then the
+        Wayback Machine. A challenge page we can't get past comes back with empty
+        text rather than as if it were content. ``links`` carries the page's
+        in-page links (HTML fetches only) for multi-hop following.
         """
+        cap = _RELEVANCE_SCAN_MAX_WORDS
+
         # Reddit serves anti-bot HTML; route through its public .json endpoint.
         if self._is_reddit_url(url):
             text = await self._fetch_reddit(session, url)
-            return url, self._trim_words(text)
+            return self._page(url, self._cap_words(text, cap), kind="reddit")
 
         # A YouTube video's real content is its transcript, not the watch page.
         if _YT_AVAILABLE and self._is_youtube_video_url(url):
             transcript = await self._fetch_youtube_transcript(url)
             if transcript:
-                return url, self._trim_words(transcript)
+                return self._page(url, self._cap_words(transcript, cap), kind="youtube")
             # No captions / blocked IP — fall through to a normal HTML fetch.
 
         status = 0
@@ -666,7 +932,7 @@ class Pipe:
 
         if is_doc:
             extracted = await self._extract_document(body_bytes)
-            return url, self._trim_words(extracted)
+            return self._page(url, self._cap_words(extracted, cap), kind="document")
 
         blocked = self._is_blocked_response(status, raw_html, headers) if status else False
         rendered_text = self._html_to_text(raw_html) if raw_html else ""
@@ -684,7 +950,12 @@ class Pipe:
                 )
                 fs_text = self._html_to_text(fs_html)
                 if fs_text and not fs_blocked and not self._is_contentless(fs_text):
-                    return url, self._trim_words(fs_text)
+                    return self._page(
+                        url,
+                        self._cap_words(fs_text, cap),
+                        links=self._extract_links(fs_html, url),
+                        kind="flaresolverr",
+                    )
                 # FlareSolverr returning a page isn't a bypass — an interactive
                 # wall (PerimeterX "Press & Hold", a CAPTCHA) renders as an
                 # ordinary page it can't solve. Keep the block flag and try the
@@ -700,12 +971,19 @@ class Pipe:
                     f"[Archived snapshot from {wb_date} via the Wayback Machine; "
                     "the live page was unavailable, so this may be out of date.]\n"
                 )
-                return url, note + self._trim_words(wb_text)
+                return self._page(
+                    url, note + self._cap_words(wb_text, cap), kind="archive"
+                )
 
         # Don't surface an unbypassed challenge page as if it were content.
         if blocked:
-            return url, ""
-        return url, self._trim_words(rendered_text)
+            return self._page(url, "", kind="blocked")
+        return self._page(
+            url,
+            self._cap_words(rendered_text, cap),
+            links=self._extract_links(raw_html, url),
+            kind="html",
+        )
 
     # -----------------------------------------------------------------------
     # Reddit JSON endpoint handling
@@ -1121,7 +1399,10 @@ class Pipe:
     # SearXNG
     # -----------------------------------------------------------------------
     async def _search(
-        self, session: aiohttp.ClientSession, query: str
+        self,
+        session: aiohttp.ClientSession,
+        query: str,
+        time_range: str = "",
     ) -> List[Dict[str, str]]:
         params: Dict[str, Any] = {
             "q": query,
@@ -1130,6 +1411,10 @@ class Pipe:
         }
         if self.valves.SEARCH_ENGINES:
             params["engines"] = self.valves.SEARCH_ENGINES
+        # Recency filter (improvement #9): the plan's hint, else the valve.
+        tr = (time_range or self.valves.SEARCH_TIME_RANGE or "").strip().lower()
+        if tr in ("day", "week", "month", "year"):
+            params["time_range"] = tr
         try:
             async with session.get(
                 f"{self.valves.SEARXNG_URL.rstrip('/')}/search",
@@ -1138,14 +1423,20 @@ class Pipe:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return [
-                        {
-                            "title": r.get("title", ""),
-                            "url": r.get("url", ""),
-                            "snippet": r.get("content", ""),
-                        }
-                        for r in data.get("results", [])
-                    ]
+                    out: List[Dict[str, str]] = []
+                    for r in data.get("results", []):
+                        # SearXNG exposes a publish date inconsistently as
+                        # "publishedDate" or "pubdate" depending on the engine.
+                        published = r.get("publishedDate") or r.get("pubdate")
+                        out.append(
+                            {
+                                "title": r.get("title", ""),
+                                "url": r.get("url", ""),
+                                "snippet": r.get("content", ""),
+                                "published_date": published,
+                            }
+                        )
+                    return out
                 log.warning(f"SearXNG {resp.status} for: {query}")
         except Exception as e:
             log.error(f"SearXNG error: {e}")
@@ -1191,6 +1482,7 @@ Initial search snippets for context:
 Create a detailed research plan as valid JSON:
 {{
     "plan_summary": "2-3 sentence summary of the approach",
+    "recency": "day|week|month|year|any",
     "sections": [
         {{
             "title": "Section title",
@@ -1204,6 +1496,8 @@ Create a detailed research plan as valid JSON:
 Guidelines:
 - 4-8 comprehensive sections with 2-3 search queries each
 - Include diverse perspectives, data, expert opinions
+- "recency": set to day/week/month/year ONLY for time-sensitive topics (current
+  events, fast-moving fields) to bias searches toward fresh sources; otherwise "any"
 - Respond with ONLY JSON — no markdown fences, no extra text."""
 
         raw = await self._llm_call(
@@ -1238,6 +1532,51 @@ Guidelines:
     # -----------------------------------------------------------------------
     # Phase 2 — research loop (fully autonomous)
     # -----------------------------------------------------------------------
+    @staticmethod
+    def _section_coverage(
+        collected: List[Dict], section_titles: List[str]
+    ) -> Dict[str, int]:
+        """Count good (verbatim, non-summary) sources gathered per planned section.
+
+        Compressed summaries are excluded so the count can only *under*-state
+        coverage — biasing the loop toward a little extra research rather than
+        stopping a section early."""
+        cov = {t: 0 for t in section_titles}
+        for s in collected:
+            if s.get("url") == "compressed_summary":
+                continue
+            sec = s.get("section")
+            if sec in cov:
+                cov[sec] += 1
+        return cov
+
+    def _build_work(self, query: str, plan: Dict) -> List[Dict[str, str]]:
+        """Build the de-duped ``(section, description, query)`` work items.
+
+        `initial_queries` form a cross-cutting "General" bucket; each planned
+        section contributes its own queries, attributed to that section (#2)."""
+        work: List[Dict[str, str]] = []
+        seen_q: set = set()
+
+        def add(section: str, desc: str, q: str) -> None:
+            q = (q or "").strip()
+            if not q:
+                return
+            k = (section.lower(), q.lower())
+            if k in seen_q:
+                return
+            seen_q.add(k)
+            work.append({"section": section, "desc": desc, "query": q, "done": False})
+
+        for q in plan.get("initial_queries", [query]) or [query]:
+            add("General", "Overview and cross-cutting context", q)
+        for sec in plan.get("sections", []) or []:
+            title = (sec.get("title") or "").strip() or "General"
+            desc = sec.get("description", "") or ""
+            for q in sec.get("search_queries", []) or []:
+                add(title, desc, q)
+        return work
+
     async def _research_loop(
         self,
         query: str,
@@ -1247,98 +1586,123 @@ Guidelines:
         session: aiohttp.ClientSession,
         emitter: Optional[Callable],
     ) -> Tuple[List[Dict[str, str]], List[str]]:
-        collected: List[Dict[str, str]] = []
-        seen_urls: set = set()
-        source_urls: List[str] = []
+        collected: List[Dict[str, Any]] = []
+        seen_urls: set = set()        # dedup keys (search results + followed links)
+        source_urls: List[str] = []   # running unique URLs for the progress snapshot
 
-        # Build de-duped query queue
-        queue: List[str] = []
-        seen_q: set = set()
-        for q in plan.get("initial_queries", [query]) + [
-            sq
-            for sec in plan.get("sections", [])
-            for sq in sec.get("search_queries", [])
-        ]:
-            ql = q.strip().lower()
-            if ql and ql not in seen_q:
-                seen_q.add(ql)
-                queue.append(q.strip())
+        # Recency: the plan's hint overrides the SEARCH_TIME_RANGE valve (#9).
+        recency = str(plan.get("recency", "") or "").strip().lower()
+        if recency not in ("day", "week", "month", "year"):
+            recency = ""
+
+        section_titles = [
+            (s.get("title") or "").strip()
+            for s in plan.get("sections", []) or []
+            if (s.get("title") or "").strip()
+        ]
+        target = max(1, self.valves.MIN_SOURCES_PER_SECTION)
+        work = self._build_work(query, plan)
+        sem = asyncio.Semaphore(self.valves.MAX_CONCURRENT_FETCHES)
+
+        async def fetch(u: str) -> Dict[str, Any]:
+            async with sem:
+                return await self._fetch_page(session, u)
 
         cycle = 0
-        qi = 0  # queue index
-
         while cycle < self.valves.MAX_RESEARCH_CYCLES:
             cycle += 1
+            cov = self._section_coverage(collected, section_titles)
             await self._emit_status(
                 emitter,
                 f"🔄 Cycle {cycle}/{self.valves.MAX_RESEARCH_CYCLES} · "
-                f"{len(collected)} snippets · "
-                f"{len(source_urls)} sources",
+                f"{len(collected)} snippets · {len(source_urls)} sources",
             )
 
-            # Pick queries
-            cqs: List[str] = []
-            for _ in range(self.valves.QUERIES_PER_CYCLE):
-                if qi < len(queue):
-                    cqs.append(queue[qi])
-                    qi += 1
+            # --- Pick this cycle's queries, gap-driven (#4) ---
+            pending = [w for w in work if not w["done"]]
+            if not pending:
+                # Nothing planned left: ask for targeted queries for the
+                # still-starved sections, then stop if there's truly nothing.
+                starved = [t for t in section_titles if cov.get(t, 0) < target]
+                if starved:
+                    await self._emit_status(emitter, "🧠 Generating gap-filling queries…")
+                    for w in await self._gap_queries(
+                        query, starved, plan, request, user
+                    ):
+                        work.append({**w, "done": False})
+                    pending = [w for w in work if not w["done"]]
+                if not pending:
+                    break
 
-            if not cqs and cycle <= self.valves.MIN_RESEARCH_CYCLES:
-                await self._emit_status(emitter, "🧠 Generating follow-up queries…")
-                cqs = await self._followup_queries(query, collected, request, user)
-            elif not cqs:
-                break
+            # Under-covered sections first; "General" sorts as already-covered.
+            pending.sort(key=lambda w: cov.get(w["section"], 10 ** 6))
+            batch = pending[: self.valves.QUERIES_PER_CYCLE]
+            for w in batch:
+                w["done"] = True
 
-            # Search. De-dup on a normalized key so the same article reached via
-            # http/https, www., trailing-slash, or tracking-param variants is
-            # only fetched once.
-            results: List[Dict[str, str]] = []
-            for cq in cqs:
-                await self._emit_status(emitter, f"🔍 Searching: {cq[:80]}…")
-                for r in await self._search(session, cq):
-                    if not r["url"]:
+            # --- Search (#9 recency, normalized de-dup) ---
+            results: List[Tuple[Dict, Dict]] = []  # (work_item, search_result)
+            for w in batch:
+                await self._emit_status(emitter, f"🔍 [{w['section']}] {w['query'][:70]}…")
+                for r in await self._search(session, w["query"], time_range=recency):
+                    if not r.get("url"):
                         continue
                     key = _dedup_key(r["url"])
-                    if key not in seen_urls:
-                        results.append(r)
-                        seen_urls.add(key)
+                    if key in seen_urls:
+                        continue
+                    seen_urls.add(key)
+                    results.append((w, r))
 
             if not results:
                 if cycle >= self.valves.MIN_RESEARCH_CYCLES:
                     break
                 continue
 
-            # Fetch
+            # --- Fetch + relevance-extract (#1) ---
             cap = self.valves.MAX_CONCURRENT_FETCHES * 2
-            await self._emit_status(
-                emitter,
-                f"📄 Fetching {min(len(results), cap)} pages…",
-            )
-            sem = asyncio.Semaphore(self.valves.MAX_CONCURRENT_FETCHES)
-
-            async def _bf(u: str) -> Tuple[str, str]:
-                async with sem:
-                    return await self._fetch_page(session, u)
-
+            batch_results = results[:cap]
+            await self._emit_status(emitter, f"📄 Fetching {len(batch_results)} pages…")
             fetched = await asyncio.gather(
-                *[_bf(r["url"]) for r in results[:cap]],
+                *[fetch(r["url"]) for _, r in batch_results],
                 return_exceptions=True,
             )
+
             new = 0
-            for item in fetched:
-                if isinstance(item, Exception):
+            hop_pool: List[Tuple[Dict, List[Tuple[str, str]]]] = []
+            for (w, r), page in zip(batch_results, fetched):
+                if isinstance(page, Exception) or not page:
                     continue
-                url, text = item
-                if text and len(text.split()) > 20:
-                    title = url
-                    for r in results:
-                        if r["url"] == url:
-                            title = r.get("title", url)
-                            break
-                    collected.append({"url": url, "title": title, "content": text})
-                    if url not in source_urls:
-                        source_urls.append(url)
+                if self._absorb(collected, source_urls, w, r, page, depth=0):
                     new += 1
+                if page.get("links"):
+                    hop_pool.append((w, page["links"]))
+
+            # --- Multi-hop: follow promising in-page links (#8) ---
+            hops = self.valves.MAX_LINK_HOPS_PER_CYCLE
+            if hops > 0 and hop_pool:
+                chosen: List[Tuple[Dict, str]] = []
+                for w, links in hop_pool:
+                    for href in _select_links(links, w["query"], seen_urls, hops):
+                        seen_urls.add(_dedup_key(href))
+                        chosen.append((w, href))
+                        if len(chosen) >= hops:
+                            break
+                    if len(chosen) >= hops:
+                        break
+                if chosen:
+                    await self._emit_status(
+                        emitter, f"🔗 Following {len(chosen)} in-page links…"
+                    )
+                    hopped = await asyncio.gather(
+                        *[fetch(href) for _, href in chosen],
+                        return_exceptions=True,
+                    )
+                    for (w, href), page in zip(chosen, hopped):
+                        if isinstance(page, Exception) or not page:
+                            continue
+                        link_r = {"title": "", "url": page.get("url", href), "published_date": None}
+                        if self._absorb(collected, source_urls, w, link_r, page, depth=1):
+                            new += 1
 
             await self._emit_status(
                 emitter,
@@ -1346,24 +1710,23 @@ Guidelines:
                 f"(total {len(collected)} · {len(source_urls)} sources)",
             )
 
-            # Compress if too large
+            # --- Relevance-aware compression (#5) ---
             tw = sum(len(s["content"].split()) for s in collected)
             if tw > self.valves.MAX_TOTAL_CONTEXT_WORDS:
-                await self._emit_status(emitter, "📦 Compressing older notes…")
+                await self._emit_status(emitter, "📦 Compressing low-relevance notes…")
                 collected = await self._compress(query, collected, request, user)
 
-            # LLM decides whether to continue
-            if cycle >= self.valves.MIN_RESEARCH_CYCLES:
-                if not await self._should_continue(
-                    query, collected, plan, cycle, request, user
-                ):
+            # --- Structural stop: every section meets its coverage target (#4) ---
+            cov = self._section_coverage(collected, section_titles)
+            if cycle >= self.valves.MIN_RESEARCH_CYCLES and section_titles:
+                if all(cov.get(t, 0) >= target for t in section_titles):
                     await self._emit_status(
                         emitter,
-                        f"🏁 Sufficient coverage after {cycle} cycles",
+                        f"🏁 All {len(section_titles)} sections covered after "
+                        f"{cycle} cycles",
                     )
                     break
 
-            # Optional politeness pause before the next cycle's searches/fetches.
             if (
                 self.valves.CYCLE_DELAY_SECONDS > 0
                 and cycle < self.valves.MAX_RESEARCH_CYCLES
@@ -1372,22 +1735,71 @@ Guidelines:
 
         return collected, source_urls
 
-    async def _followup_queries(
-        self, query: str, collected: List[Dict], request: Any, user: Any
-    ) -> List[str]:
-        summary = "\n".join(
-            f"- {s['title']}: {' '.join(s['content'].split()[:50])}…"
-            for s in collected[-10:]
+    def _absorb(
+        self,
+        collected: List[Dict],
+        source_urls: List[str],
+        work_item: Dict,
+        result: Dict,
+        page: Dict,
+        *,
+        depth: int,
+    ) -> bool:
+        """Relevance-extract a fetched page and, if useful, append it to
+        `collected` with full attribution (#1, #2, #9). Returns True if kept."""
+        passages, score = _extract_relevant(
+            page.get("text", ""), work_item["query"], self.valves.SNIPPET_MAX_WORDS
+        )
+        # Drop empty/blocked shells, but keep concise factual passages — the
+        # content is already relevance-filtered, so a small floor suffices (the
+        # old >20-word floor was tuned for whole-page text, not extracts).
+        if not passages or len(passages.split()) < 8:
+            return False
+        url = page.get("url") or result.get("url")
+        collected.append(
+            {
+                "url": url,
+                "title": result.get("title") or url,
+                "content": passages,
+                "section": work_item["section"],
+                "query": work_item["query"],
+                "published_date": result.get("published_date"),
+                "score": round(score, 3),
+                "depth": depth,
+            }
+        )
+        if url and url not in source_urls:
+            source_urls.append(url)
+        return True
+
+    async def _gap_queries(
+        self,
+        query: str,
+        starved_sections: List[str],
+        plan: Dict,
+        request: Any,
+        user: Any,
+    ) -> List[Dict[str, str]]:
+        """Generate search queries targeted at the sections still short on sources
+        (#4). Returns ``[{section, desc, query}]`` attributed to those sections."""
+        sec_map = {
+            (s.get("title") or "").strip(): s.get("description", "") or ""
+            for s in plan.get("sections", []) or []
+        }
+        desc_lines = "\n".join(
+            f"- {t}: {sec_map.get(t, '')}" for t in starved_sections
         )
         raw = await self._llm_call(
             [
                 {
                     "role": "user",
                     "content": (
-                        f"Generate {self.valves.QUERIES_PER_CYCLE} new "
-                        f"search queries to fill gaps.\n\n"
-                        f"Original: {query}\n\nRecent:\n{summary}\n\n"
-                        f"Respond with ONLY a JSON array of strings."
+                        f"Research topic: {query}\n\n"
+                        f"These report sections still lack sources:\n{desc_lines}\n\n"
+                        f"Generate up to {self.valves.QUERIES_PER_CYCLE} focused web "
+                        "search queries to fill these gaps. Respond with ONLY a JSON "
+                        'array of objects: [{"section":"<exact section title>",'
+                        '"query":"<search query>"}].'
                     ),
                 }
             ],
@@ -1395,58 +1807,62 @@ Guidelines:
             user,
             temperature=0.5,
         )
-        qs = _extract_json(raw)
-        if isinstance(qs, list):
-            return [str(q) for q in qs[: self.valves.QUERIES_PER_CYCLE]]
-        return [f"{query} additional information"]
-
-    async def _should_continue(
-        self,
-        query: str,
-        collected: List[Dict],
-        plan: Dict,
-        cycle: int,
-        request: Any,
-        user: Any,
-    ) -> bool:
-        r = await self._llm_call(
-            [
-                {
-                    "role": "user",
-                    "content": (
-                        f"Original query: {query}\n"
-                        f"Planned sections: "
-                        f"{json.dumps([s['title'] for s in plan.get('sections',[])])}\n"
-                        f"Cycle: {cycle}/{self.valves.MAX_RESEARCH_CYCLES}\n"
-                        f"Sources: {len(collected)}\n"
-                        f"Titles: {json.dumps([s['title'] for s in collected[-15:]])}\n\n"
-                        f'Respond ONLY "CONTINUE" or "STOP" + brief reason.'
-                    ),
-                }
-            ],
-            request,
-            user,
-            temperature=0.2,
-            max_tokens=100,
-        )
-        return r.strip().upper().startswith("CONTINUE")
+        data = _extract_json(raw)
+        out: List[Dict[str, str]] = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    sec = str(item.get("section", "")).strip()
+                    q = str(item.get("query", "")).strip()
+                    if not q:
+                        continue
+                    if sec not in sec_map:
+                        sec = starved_sections[0]
+                    out.append({"section": sec, "desc": sec_map.get(sec, ""), "query": q})
+                elif isinstance(item, str) and item.strip():
+                    sec = starved_sections[0]
+                    out.append(
+                        {"section": sec, "desc": sec_map.get(sec, ""), "query": item.strip()}
+                    )
+        if not out:
+            for t in starved_sections[: self.valves.QUERIES_PER_CYCLE]:
+                out.append({"section": t, "desc": sec_map.get(t, ""), "query": f"{query} {t}"})
+        return out
 
     async def _compress(
         self, query: str, collected: List[Dict], request: Any, user: Any
-    ) -> List[Dict[str, str]]:
-        sp = len(collected) // 2
-        old, recent = collected[:sp], collected[sp:]
+    ) -> List[Dict[str, Any]]:
+        """Shrink the running context by keeping the highest-relevance sources
+        verbatim and summarizing the rest (#5) — relevance-aware, unlike the old
+        keep-the-recent-half approach. Section attribution and citation URLs of
+        the summarized sources are preserved."""
+        # Keep prior summaries as-is; rank the rest by relevance score.
+        prior_summaries = [s for s in collected if s.get("url") == "compressed_summary"]
+        real = [s for s in collected if s.get("url") != "compressed_summary"]
+        ranked = sorted(real, key=lambda s: s.get("score", 0.0), reverse=True)
+
+        budget = max(1, self.valves.MAX_TOTAL_CONTEXT_WORDS // 2)
+        keep_ids: set = set()
+        used = 0
+        for s in ranked:
+            wc = len(s.get("content", "").split())
+            if used + wc <= budget or not keep_ids:
+                keep_ids.add(id(s))
+                used += wc
+        rest = [s for s in real if id(s) not in keep_ids]
+        if not rest:
+            return collected
+
         old_text = "\n\n".join(
-            f"Source: {s['title']} ({s['url']})\n{s['content']}" for s in old
+            f"Source: {s['title']} ({s['url']})\n{s['content']}" for s in rest
         )
         summary = await self._llm_call(
             [
                 {
                     "role": "user",
                     "content": (
-                        f"Summarise these research notes. Keep all key "
-                        f"facts/data.\nTopic: {query}\n\n"
-                        f"{old_text[:15000]}"
+                        "Summarise these research notes. Keep all key facts/data.\n"
+                        f"Topic: {query}\n\n{old_text[:15000]}"
                     ),
                 }
             ],
@@ -1455,26 +1871,69 @@ Guidelines:
             temperature=0.2,
             max_tokens=3000,
         )
-        # Preserve the real URLs the summary folds together so the report's
-        # citation list can still name them (the per-source content is gone, but
-        # the attribution shouldn't be).
-        covered = [
-            s["url"]
-            for s in old
-            if s.get("url") and s["url"] != "compressed_summary"
-        ]
-        return [
-            {
-                "url": "compressed_summary",
-                "title": f"Summary of {len(old)} earlier sources",
-                "content": summary,
-                "source_urls": covered,
-            }
-        ] + recent
+        covered = [s["url"] for s in rest if s.get("url")]
+        summary_entry = {
+            "url": "compressed_summary",
+            "title": f"Summary of {len(rest)} lower-relevance sources",
+            "content": summary,
+            "source_urls": covered,
+            "section": "General",
+            "query": query,
+            "score": 0.0,
+            "depth": 0,
+        }
+        # Verbatim keepers in their original order, then prior + new summaries.
+        kept = [s for s in collected if id(s) in keep_ids]
+        return kept + prior_summaries + [summary_entry]
 
     # -----------------------------------------------------------------------
     # Phase 3 — final report
     # -----------------------------------------------------------------------
+    def _build_source_index(
+        self, collected: List[Dict]
+    ) -> Tuple[List[Dict], str]:
+        """Assign one global ``[n]`` number to each source and build the shared
+        citation list. Sources past REPORT_CONTEXT_MAX_CHARS are dropped from
+        BOTH the data and the references, so a citation can never point at a
+        source the model wasn't shown. Returns ``(indexed, refs)`` where each
+        `indexed` entry is ``{idx, src, block}`` (block = the SOURCE-n text)."""
+        source_cap = self.valves.REPORT_SOURCE_MAX_CHARS
+        ctx_budget = self.valves.REPORT_CONTEXT_MAX_CHARS
+
+        indexed: List[Dict] = []
+        ref_lines: List[str] = []
+        used = 0
+        n = 0
+        for s in collected:
+            content = s.get("content") or ""
+            if source_cap > 0:
+                content = content[:source_cap]
+            idx = n + 1
+            block = (
+                f"\n--- SOURCE {idx}: {s.get('title') or s.get('url')} "
+                f"({s.get('url')}) ---\n{content}\n"
+            )
+            if ctx_budget > 0 and n > 0 and used + len(block) > ctx_budget:
+                break
+            used += len(block)
+            n = idx
+            indexed.append({"idx": idx, "src": s, "block": block})
+            if s.get("url") == "compressed_summary":
+                covered = s.get("source_urls") or []
+                ref_lines.append(
+                    f"[{idx}] Summary of earlier sources"
+                    + (": " + "; ".join(covered) if covered else "")
+                )
+            else:
+                ref_lines.append(f"[{idx}] {s.get('url')}")
+        if len(collected) - n > 0:
+            log.info(
+                "Report context budget reached: included %d of %d sources",
+                n,
+                len(collected),
+            )
+        return indexed, "\n".join(ref_lines)
+
     async def _generate_report(
         self,
         query: str,
@@ -1486,64 +1945,27 @@ Guidelines:
         emitter: Optional[Callable],
     ) -> str:
         await self._emit_status(emitter, "📝 Writing final report…")
+        indexed, refs = self._build_source_index(collected)
 
-        # Build the source blocks and the [n] citation list from ONE numbering so
-        # "SOURCE n" in the data, "[n]" in the text, and the reference list always
-        # agree. Sources are added until the character budget is hit; any past it
-        # are dropped from BOTH the data and the references, so the model can
-        # never cite a source it wasn't actually shown. (`source_urls` — the full
-        # running list — is still used for the progress snapshot, not here.)
-        source_cap = self.valves.REPORT_SOURCE_MAX_CHARS
-        ctx_budget = self.valves.REPORT_CONTEXT_MAX_CHARS
+        mode = (self.valves.REPORT_MODE or "sectioned").strip().lower()
+        if mode == "single" or not plan.get("sections"):
+            return await self._report_single(query, plan, indexed, refs, request, user)
+        return await self._report_sectioned(
+            query, plan, indexed, refs, request, user, emitter
+        )
 
-        blocks: List[str] = []
-        ref_lines: List[str] = []
-        used_chars = 0
-        n = 0
-        for s in collected:
-            content = s.get("content") or ""
-            if source_cap > 0:
-                content = content[:source_cap]
-            idx = n + 1
-            block = (
-                f"\n--- SOURCE {idx}: {s.get('title') or s.get('url')} "
-                f"({s.get('url')}) ---\n{content}\n"
-            )
-            # Stop once the budget is exhausted, but always keep at least one.
-            if ctx_budget > 0 and n > 0 and used_chars + len(block) > ctx_budget:
-                break
-            blocks.append(block)
-            used_chars += len(block)
-            n = idx
-            if s.get("url") == "compressed_summary":
-                covered = s.get("source_urls") or []
-                if covered:
-                    ref_lines.append(
-                        f"[{idx}] Summary of earlier sources: " + "; ".join(covered)
-                    )
-                else:
-                    ref_lines.append(f"[{idx}] Summary of earlier sources")
-            else:
-                ref_lines.append(f"[{idx}] {s.get('url')}")
-
-        ctx = "".join(blocks)
-        refs = "\n".join(ref_lines)
-        dropped = len(collected) - n
-        if dropped > 0:
-            log.info(
-                "Report context budget reached: included %d of %d sources",
-                n,
-                len(collected),
-            )
-
+    async def _report_single(
+        self, query: str, plan: Dict, indexed: List[Dict], refs: str,
+        request: Any, user: Any,
+    ) -> str:
+        """Legacy one-shot report: the whole report in a single LLM call."""
+        ctx = "".join(e["block"] for e in indexed)
         secs = "\n".join(
             f"- {s['title']}: {s.get('description','')}"
             for s in plan.get("sections", [])
         )
-
         smin = self.valves.SECTION_MIN_WORDS
         smax = self.valves.SECTION_MAX_WORDS
-
         prompt = f"""You are a research report writer. Write a comprehensive, well-structured research report based ONLY on the provided research data. Do NOT rely on your own knowledge — use only the sources below.
 
 **Research Topic:** {query}
@@ -1580,21 +2002,144 @@ Synthesise findings, key takeaways, limitations, areas for further research.
 Numbered list of all sources with URLs matching [n] citations.
 
 GUIDELINES:
-- Each section MUST be {smin}-{smax} words. Do not write short paragraphs — develop each section thoroughly with analysis, examples, and data from the sources.
+- Each section MUST be {smin}-{smax} words. Develop each section thoroughly with analysis, examples, and data from the sources.
 - Write in a clear, professional, analytical tone.
 - Base ALL claims on the provided research data and cite with [n].
 - Include specific data, statistics, and findings from sources.
 - Cover ALL planned sections — do not skip or merge sections.
 - If data is thin for a section, note the gap but still write what you can.
-- Write the COMPLETE report — do not truncate, summarise prematurely, or say "continued below"."""
-
+- Write the COMPLETE report — do not truncate or say "continued below"."""
         return await self._llm_call(
             [{"role": "user", "content": prompt}],
-            request,
-            user,
-            temperature=0.3,
-            max_tokens=self.valves.REPORT_MAX_TOKENS,
+            request, user, temperature=0.3, max_tokens=self.valves.REPORT_MAX_TOKENS,
         )
+
+    async def _report_sectioned(
+        self, query: str, plan: Dict, indexed: List[Dict], refs: str,
+        request: Any, user: Any, emitter: Optional[Callable],
+    ) -> str:
+        """Section-by-section report (#2, #3): each section is drafted in its own
+        LLM call against only its attributed sources (plus shared cross-cutting
+        ones), all citing the SAME global ``[n]`` index; a synthesis pass then
+        writes the title/abstract/conclusion. Sections are drafted concurrently."""
+        sections = plan.get("sections", []) or []
+        # Cross-cutting sources (General bucket + compressed summaries) are shared
+        # context every section may cite.
+        general = [
+            e for e in indexed
+            if e["src"].get("section") in (None, "", "General")
+            or e["src"].get("url") == "compressed_summary"
+        ]
+
+        async def draft(sec: Dict) -> Tuple[str, str]:
+            title = (sec.get("title") or "Section").strip()
+            own = [e for e in indexed if e["src"].get("section") == title]
+            # Always give the section its own sources; top up with shared ones.
+            chosen = own + [e for e in general if e not in own]
+            await self._emit_status(emitter, f"📝 Writing section: {title[:60]}…")
+            text = await self._write_section(
+                query, title, sec.get("description", "") or "", chosen, len(own),
+                request, user,
+            )
+            return title, text
+
+        await self._emit_status(
+            emitter, f"📝 Drafting {len(sections)} sections…"
+        )
+        drafts = await asyncio.gather(
+            *[draft(sec) for sec in sections], return_exceptions=True
+        )
+        section_texts: List[str] = []
+        toc: List[str] = []
+        for i, d in enumerate(drafts):
+            if isinstance(d, Exception):
+                title = (sections[i].get("title") or f"Section {i+1}").strip()
+                section_texts.append(f"## {title}\n\n*(Section generation failed.)*")
+                toc.append(title)
+                continue
+            title, text = d
+            toc.append(title)
+            text = text.strip()
+            if not text.lower().startswith("#"):
+                text = f"## {title}\n\n{text}"
+            section_texts.append(text)
+
+        # Synthesis pass: title, abstract, conclusion from the section drafts.
+        await self._emit_status(emitter, "📝 Writing abstract & conclusion…")
+        title, abstract, conclusion = await self._write_synthesis(
+            query, "\n\n".join(section_texts), request, user
+        )
+
+        toc_md = "\n".join(f"{i+1}. {t}" for i, t in enumerate(toc))
+        parts = [
+            f"# {title}",
+            "## Abstract\n" + abstract,
+            "## Table of Contents\n" + toc_md,
+            "\n\n".join(section_texts),
+            "## Conclusion\n" + conclusion,
+            "## Sources\n" + (refs or "*(no sources)*"),
+        ]
+        return "\n\n".join(parts)
+
+    async def _write_section(
+        self, query: str, title: str, desc: str, chosen: List[Dict],
+        own_count: int, request: Any, user: Any,
+    ) -> str:
+        """Draft a single report section against `chosen` sources, citing their
+        global ``[n]`` numbers."""
+        smin = self.valves.SECTION_MIN_WORDS
+        smax = self.valves.SECTION_MAX_WORDS
+        blocks = "".join(e["block"] for e in chosen) or "(no sources gathered for this section)"
+        coverage_note = (
+            f"This section has {own_count} directly-relevant source(s)."
+            + (" Coverage is thin — note any gaps briefly but still write what the "
+               "sources support." if own_count < self.valves.MIN_SOURCES_PER_SECTION else "")
+        )
+        prompt = f"""You are writing ONE section of a larger research report. Write ONLY this section — no title page, abstract, intro, or conclusion.
+
+Research topic: {query}
+Section title: {title}
+Section focus: {desc}
+
+{coverage_note}
+
+Sources (cite using the bracketed [n] numbers EXACTLY as shown — they are global to the whole report):
+{blocks}
+
+Write the section as Markdown beginning with "## {title}". Target {smin}-{smax} words.
+Base every claim ONLY on the sources above and cite with [n]. Include specific data, findings, and differing viewpoints where present. Do not invent sources or citation numbers."""
+        return await self._llm_call(
+            [{"role": "user", "content": prompt}],
+            request, user, temperature=0.3, max_tokens=self.valves.REPORT_MAX_TOKENS,
+        )
+
+    async def _write_synthesis(
+        self, query: str, sections_md: str, request: Any, user: Any,
+    ) -> Tuple[str, str, str]:
+        """Write the report title, abstract, and conclusion from the drafted
+        sections. Returns ``(title, abstract, conclusion)`` with safe fallbacks."""
+        prompt = f"""You are finalizing a research report. Based ONLY on the drafted sections below, write the report's title, abstract, and conclusion.
+
+Research topic: {query}
+
+Drafted sections:
+{sections_md[:20000]}
+
+Respond with ONLY a JSON object:
+{{"title": "concise report title", "abstract": "200-300 word summary of key findings", "conclusion": "synthesis of findings, key takeaways, limitations, and areas for further research"}}
+You may reference the existing [n] citation numbers that appear in the sections."""
+        raw = await self._llm_call(
+            [{"role": "user", "content": prompt}],
+            request, user, temperature=0.3, max_tokens=2000,
+        )
+        data = _extract_json(raw)
+        if isinstance(data, dict):
+            return (
+                str(data.get("title") or f"Research Report: {query}").strip(),
+                str(data.get("abstract") or "").strip(),
+                str(data.get("conclusion") or "").strip(),
+            )
+        return f"Research Report: {query}", "", ""
 
     # -----------------------------------------------------------------------
     # Progress snapshot (survives page refresh)

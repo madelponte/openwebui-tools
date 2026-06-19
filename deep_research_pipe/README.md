@@ -8,7 +8,7 @@ The pipe runs in three phases:
 
 **Phase 1 — Research Plan.** When you send a query, the pipe runs a few broad exploratory searches on your topic, then asks the LLM to generate a structured research plan with named sections and targeted search queries. The plan is presented to you in a confirmation dialog. You can type "ok" to proceed, or describe changes (e.g. "add a section on pricing" or "focus more on the European market") and it will adjust the plan before continuing. Set `SKIP_PLAN_CONFIRMATION` to `True` if you want it to skip this step and go straight to researching.
 
-**Phase 2 — Research Loop.** The pipe works through the planned search queries across multiple cycles. Each cycle searches SearXNG, fetches the actual page content (with concurrent downloads), and accumulates text snippets. After reaching the minimum number of cycles, the LLM evaluates whether coverage is sufficient or if more searching is needed. If the accumulated context gets too large, older snippets are compressed into summaries. This phase runs fully autonomously with no user interaction — you just see status updates in the UI.
+**Phase 2 — Research Loop.** The pipe researches one planned section at a time, prioritising whichever sections have the fewest sources so far (gap-driven), across multiple cycles. Each cycle searches SearXNG, fetches pages concurrently, and — instead of keeping the first few hundred words of each page — **extracts the passages most relevant to the query that surfaced it** and stores them tagged with their section, the originating query, a relevance score, and (when available) the source's publish date. It also **follows a few promising links found inside fetched pages** (multi-hop) to reach primary sources the search engine didn't rank. The loop keeps going until every planned section has met its coverage target (`MIN_SOURCES_PER_SECTION`) or the cycle cap is reached; if a section stays starved, the LLM generates new queries aimed specifically at it. When the accumulated context gets too large, the **lowest-relevance** snippets are compressed into a summary while the highest-scored ones are kept verbatim. On time-sensitive topics the plan biases searches toward recent results. This phase runs fully autonomously — you just see status updates in the UI.
 
 **Resilient fetching.** Page downloads mirror the companion `fetch_page` MCP tool's fallback ladder so more of the URLs the model finds actually yield content:
 
@@ -20,7 +20,7 @@ The pipe runs in three phases:
 
 Reddit links continue to be read through Reddit's public `.json` endpoint.
 
-**Phase 3 — Report.** The collected research is passed to the LLM with instructions to write a report using only the gathered sources. The report includes an abstract, table of contents, detailed sections with `[n]` citations, a conclusion, and a numbered source list. The source blocks and the `[n]` citation list are built from one shared numbering, so a citation always points at the source the model was actually shown; if the research exceeds `REPORT_CONTEXT_MAX_CHARS`, the sources past the budget are dropped from both the data and the citation list together (never cited-but-unseen). Citations are also emitted as clickable source chips below the message in Open WebUI's interface.
+**Phase 3 — Report.** By default (`REPORT_MODE="sectioned"`) each report section is drafted in its own LLM call against **only that section's gathered sources** (plus shared cross-cutting context), then a final synthesis pass writes the title, abstract, and conclusion from the drafted sections. Writing sections independently produces more thorough, better-grounded coverage and scales past a single call's token ceiling. Every source is assigned one **global `[n]` number** that is shared across all section prompts, so a citation always points at the source the model was actually shown — even though sections are written separately. If the research exceeds `REPORT_CONTEXT_MAX_CHARS`, sources past the budget are dropped from both the data and the citation list together (never cited-but-unseen). Set `REPORT_MODE="single"` to fall back to the legacy one-shot report (cheaper, fewer LLM calls). Citations are also emitted as clickable source chips below the message in Open WebUI's interface.
 
 ## Installation
 
@@ -62,7 +62,7 @@ flaresolverr:
 | Valve | Default | Description |
 |---|---|---|
 | `RESEARCH_MODEL` | *(empty)* | Model ID for all LLM calls (planning, analysis, report writing). Leave blank to use the system default. Should be a capable model with good instruction-following. |
-| `EMBEDDING_MODEL` | *(empty)* | Embedding model for PDF parsing. Reserved for future use. |
+| `EMBEDDING_MODEL` | *(empty)* | Optional. Reserved hook for embedding-based relevance ranking of page passages/sources; when set the pipe uses it if the Open WebUI embeddings endpoint resolves and otherwise falls back to the built-in lexical (keyword-overlap) scorer. Blank = lexical-only (the default; no setup needed). |
 
 ### Search Engine
 
@@ -71,6 +71,7 @@ flaresolverr:
 | `SEARXNG_URL` | `http://searxng:8080` | Base URL of your SearXNG instance. |
 | `SEARCH_RESULTS_PER_QUERY` | `10` | How many results SearXNG returns per query. |
 | `SEARCH_ENGINES` | *(empty)* | Comma-separated engine list (e.g. `google,bing,duckduckgo`). Blank uses SearXNG's defaults. |
+| `SEARCH_TIME_RANGE` | *(empty)* | Recency filter on every search: blank, `day`, `week`, `month`, or `year`. The research plan's own recency hint (for time-sensitive topics) overrides this per run. |
 
 ### FlareSolverr
 
@@ -88,25 +89,28 @@ flaresolverr:
 
 | Valve | Default | Description |
 |---|---|---|
-| `SNIPPET_MAX_WORDS` | `300` | Max words kept per page snippet. Lower values keep context small; higher values capture more detail per source. |
-| `MAX_TOTAL_CONTEXT_WORDS` | `30000` | Soft cap on total accumulated research text. When exceeded, older snippets are compressed into summaries by the LLM. |
+| `SNIPPET_MAX_WORDS` | `300` | Word budget kept per source **after relevance extraction** — the passages most relevant to the query are selected up to this many words (not the first N words of the page). |
+| `MAX_TOTAL_CONTEXT_WORDS` | `30000` | Soft cap on total accumulated research text. When exceeded, the lowest-relevance snippets are compressed into a summary while the highest-scored ones are kept verbatim. |
 
 ### Research Cycles
 
 | Valve | Default | Description |
 |---|---|---|
-| `MIN_RESEARCH_CYCLES` | `2` | Minimum search-fetch-analyse cycles before the LLM is allowed to stop early. |
+| `MIN_RESEARCH_CYCLES` | `2` | Minimum cycles before the loop is allowed to stop early on coverage. |
 | `MAX_RESEARCH_CYCLES` | `5` | Hard cap on cycles. More cycles = more sources but longer runtime. |
 | `QUERIES_PER_CYCLE` | `3` | Number of search queries executed per cycle. |
+| `MIN_SOURCES_PER_SECTION` | `2` | Coverage target per planned section. The loop prioritises under-covered sections and keeps researching until every section has at least this many good sources (or cycles run out). |
+| `MAX_LINK_HOPS_PER_CYCLE` | `3` | Multi-hop budget: how many promising links found *inside* fetched pages to follow each cycle (depth 1 only) to reach primary sources beyond the search results. `0` disables link-following. |
 | `CYCLE_DELAY_SECONDS` | `0` | Seconds to pause between research cycles. Raise (e.g. 2–5) if SearXNG or source sites rate-limit you. `0` = no delay. |
 
 ### Report Length
 
 | Valve | Default | Description |
 |---|---|---|
+| `REPORT_MODE` | `sectioned` | `sectioned` drafts each section in its own LLM call against only that section's sources, then a synthesis pass writes the abstract/conclusion (more thorough; more LLM calls). `single` writes the whole report in one call (legacy, cheaper). |
 | `SECTION_MIN_WORDS` | `200` | Target minimum words per report section. Increase for more detailed writing. |
 | `SECTION_MAX_WORDS` | `500` | Target maximum words per report section. Set to 800–1000 for thorough deep-dives. |
-| `REPORT_MAX_TOKENS` | `16384` | Max tokens the LLM can generate for the final report. Increase if the report is being cut off. |
+| `REPORT_MAX_TOKENS` | `16384` | Max tokens the LLM can generate per section (sectioned mode) or for the whole report (single mode). Increase if output is being cut off. |
 | `REPORT_SOURCE_MAX_CHARS` | `2000` | Max characters of each source's text included in the report prompt. `0` = no per-source cap. |
 | `REPORT_CONTEXT_MAX_CHARS` | `60000` | Total character budget for all source text in the report prompt. Sources past the budget are dropped from both the data and the citation list. Raise for fuller reports on long-context models; `0` = unbounded. |
 
@@ -127,8 +131,8 @@ flaresolverr:
 
 ## Tips
 
-- **Longer reports:** Increase `SECTION_MAX_WORDS` to 800 or 1000, and make sure `REPORT_MAX_TOKENS` is high enough (16384+) so the model doesn't run out of generation budget.
-- **More thorough research:** Increase `MAX_RESEARCH_CYCLES` to 7–10 and `QUERIES_PER_CYCLE` to 4–5. This will take longer but finds more sources.
-- **Faster runs:** Lower `MAX_RESEARCH_CYCLES` to 2–3, reduce `SEARCH_RESULTS_PER_QUERY` to 5, and set `SKIP_PLAN_CONFIRMATION` to `True`.
+- **Longer reports:** Increase `SECTION_MAX_WORDS` to 800 or 1000, and make sure `REPORT_MAX_TOKENS` is high enough (16384+) so the model doesn't run out of generation budget. In `sectioned` mode the token budget applies per section, so longer sections are easier to get than in `single` mode.
+- **More thorough research:** Increase `MAX_RESEARCH_CYCLES` to 7–10, `QUERIES_PER_CYCLE` to 4–5, and `MIN_SOURCES_PER_SECTION` to 3–4 so the loop keeps digging until each section is well covered. Raise `MAX_LINK_HOPS_PER_CYCLE` to follow more primary-source links.
+- **Faster / cheaper runs:** Lower `MAX_RESEARCH_CYCLES` to 2–3 and `MIN_SOURCES_PER_SECTION` to 1, reduce `SEARCH_RESULTS_PER_QUERY` to 5, set `MAX_LINK_HOPS_PER_CYCLE` to 0, set `REPORT_MODE` to `single`, and set `SKIP_PLAN_CONFIRMATION` to `True`. Section-by-section reports and multi-hop add LLM calls and fetches, so these cut cost the most.
 - **Rate limiting issues:** If SearXNG or source sites return errors, reduce `MAX_CONCURRENT_FETCHES` and `SEARCH_RESULTS_PER_QUERY`, and raise `CYCLE_DELAY_SECONDS` to pause between cycles.
 - **Page refresh during research:** The pipe writes a progress snapshot into the message body early on, so if you refresh mid-research you'll see a summary of what's been collected so far rather than a blank message. The final report replaces this snapshot when complete.
