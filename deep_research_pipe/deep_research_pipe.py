@@ -1,7 +1,7 @@
 """
 title: Deep Research
 author: mdelponte
-version: 2.0.0
+version: 2.4.0
 license: MIT
 description: >
     A deep research pipe that takes a user query, generates a research plan,
@@ -22,8 +22,10 @@ required_open_webui_version: 0.9.0
 import asyncio
 import json
 import logging
+import math
 import re
 import time
+from datetime import datetime, timezone
 from urllib.parse import (
     urlparse,
     urlunparse,
@@ -341,6 +343,108 @@ def _score_segment(seg_tokens: set, query_tokens: set) -> float:
     return len(seg_tokens & query_tokens) / len(query_tokens)
 
 
+def _cosine(a: List[float], b: List[float]) -> float:
+    """Cosine similarity of two equal-length vectors (0.0 on any degeneracy).
+
+    Pure-Python so the embedding reranker needs no numpy; the vectors are short
+    (one query + a page's segments, each a few hundred dims) so this is cheap.
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+# ---------------------------------------------------------------------------
+# Publish-date handling
+#
+# SearXNG reports a source's publish date inconsistently (ISO 8601, RFC 822, a
+# bare year, …) and only for some engines. We parse it best-effort to: surface
+# it in the report's reference list, break relevance ties toward fresher sources
+# when the plan flagged the topic as time-sensitive, and flag clearly stale
+# sources. Anything unparseable is simply treated as "no date" — never an error.
+# ---------------------------------------------------------------------------
+
+# How old (in days) a source may be before it's flagged "may be outdated",
+# keyed by the plan's recency level. Tied to the topic's own time-sensitivity:
+# an evergreen topic (no recency flag) never flags a source as stale.
+_STALE_AFTER_DAYS = {"day": 7, "week": 30, "month": 180, "year": 730}
+
+# strptime formats tried after ISO 8601, covering the common engine outputs.
+_DATE_FORMATS = (
+    "%a, %d %b %Y %H:%M:%S %z",  # RFC 822 (e.g. Mon, 15 Jan 2024 10:00:00 +0000)
+    "%a, %d %b %Y %H:%M:%S %Z",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y/%m/%d",
+    "%d %B %Y",
+    "%B %d, %Y",
+    "%d %b %Y",
+)
+
+
+def _to_naive_utc(dt: datetime) -> datetime:
+    """Normalize a datetime to naive UTC so all dates compare on one timeline."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _parse_date(raw: Optional[str]) -> Optional[datetime]:
+    """Best-effort parse of a SearXNG publish date into a naive-UTC datetime.
+
+    Tries ISO 8601 (tolerating a trailing ``Z``), then a handful of common
+    formats, then a leading ``YYYY-MM-DD`` or bare ``YYYY``. Returns ``None`` for
+    anything unparseable/blank — the caller treats that as "no date".
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    try:
+        return _to_naive_utc(datetime.fromisoformat(s.replace("Z", "+00:00")))
+    except Exception:
+        pass
+    for fmt in _DATE_FORMATS:
+        try:
+            return _to_naive_utc(datetime.strptime(s, fmt))
+        except Exception:
+            continue
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.match(r"(\d{4})\b", s)
+    if m:
+        try:
+            return datetime(int(m.group(1)), 1, 1)
+        except ValueError:
+            return None
+    return None
+
+
+def _is_stale(dt: Optional[datetime], recency: str, now: datetime) -> bool:
+    """True if `dt` is older than the staleness window for `recency`.
+
+    Only flags when the plan set a recency level (time-sensitive topic); for an
+    evergreen topic (recency "") or an unparseable date, returns False.
+    """
+    days = _STALE_AFTER_DAYS.get(recency)
+    if not days or dt is None:
+        return False
+    return (now - dt).days > days
+
+
 def _extract_relevant(
     text: str, query: str, max_words: int, *, scan_max: int = _RELEVANCE_SCAN_MAX_WORDS
 ) -> Tuple[str, float]:
@@ -447,11 +551,16 @@ class Pipe:
         EMBEDDING_MODEL: str = Field(
             default="",
             description=(
-                "Optional embedding model ID. Reserved hook for embedding-based "
-                "relevance ranking of page passages/sources; when set the pipe "
-                "uses it if the Open WebUI embeddings endpoint resolves and "
-                "otherwise falls back to the built-in lexical (keyword-overlap) "
-                "scorer. Blank = lexical-only (the default, no setup needed)."
+                "Optional embedding model ID for semantic relevance ranking of "
+                "page passages. When set, the query and each candidate segment "
+                "are embedded via Open WebUI's configured embeddings endpoint and "
+                "cosine-ranked, catching synonym/paraphrase matches the lexical "
+                "(keyword-overlap) scorer misses. For the 'openai'/'ollama'/"
+                "'azure_openai' RAG engines this exact model ID is used; for the "
+                "local engine Open WebUI's configured embedding model is used. "
+                "Falls back to the lexical scorer when the endpoint isn't "
+                "configured or a request fails. Blank = lexical-only (the "
+                "default, no setup needed)."
             ),
         )
 
@@ -541,6 +650,18 @@ class Pipe:
                 "Multi-hop budget: how many promising links found INSIDE fetched "
                 "pages to follow each cycle (depth 1 only) to reach primary "
                 "sources beyond the search results. 0 disables link-following."
+            ),
+        )
+        FOLLOWUP_QUERIES_PER_CYCLE: int = Field(
+            default=2,
+            description=(
+                "Proactive thread-pulling: after each cycle a cheap LLM pass over "
+                "the passages just gathered proposes up to this many follow-up "
+                "searches for specific studies, datasets, people, organisations, "
+                "or counter-claims that warrant their own query. They join the "
+                "queue alongside planned and gap-filling queries, so the loop "
+                "follows threads it discovers instead of only executing the fixed "
+                "plan. 0 disables (plan + reactive gap-filling only)."
             ),
         )
         CYCLE_DELAY_SECONDS: float = Field(
@@ -642,6 +763,9 @@ class Pipe:
         self.id = "deep_research"
         self.name = "Deep Research"
         self.valves = self.Valves()
+        # One-time log guard so a missing/failing embeddings endpoint reports the
+        # lexical fallback once per process instead of on every page.
+        self._embed_fallback_logged = False
 
     # -----------------------------------------------------------------------
     # LLM helper (internal, non-streaming)
@@ -1533,6 +1657,13 @@ Guidelines:
     # Phase 2 — research loop (fully autonomous)
     # -----------------------------------------------------------------------
     @staticmethod
+    def _plan_recency(plan: Dict) -> str:
+        """The plan's normalized recency level (``day``/``week``/``month``/
+        ``year``), or ``""`` when the topic isn't time-sensitive."""
+        r = str((plan or {}).get("recency", "") or "").strip().lower()
+        return r if r in ("day", "week", "month", "year") else ""
+
+    @staticmethod
     def _section_coverage(
         collected: List[Dict], section_titles: List[str]
     ) -> Dict[str, int]:
@@ -1591,9 +1722,7 @@ Guidelines:
         source_urls: List[str] = []   # running unique URLs for the progress snapshot
 
         # Recency: the plan's hint overrides the SEARCH_TIME_RANGE valve (#9).
-        recency = str(plan.get("recency", "") or "").strip().lower()
-        if recency not in ("day", "week", "month", "year"):
-            recency = ""
+        recency = self._plan_recency(plan)
 
         section_titles = [
             (s.get("title") or "").strip()
@@ -1668,11 +1797,15 @@ Guidelines:
             )
 
             new = 0
+            cycle_start = len(collected)  # index of this cycle's first new passage
             hop_pool: List[Tuple[Dict, List[Tuple[str, str]]]] = []
             for (w, r), page in zip(batch_results, fetched):
                 if isinstance(page, Exception) or not page:
                     continue
-                if self._absorb(collected, source_urls, w, r, page, depth=0):
+                if await self._absorb(
+                    collected, source_urls, w, r, page, depth=0,
+                    request=request, user=user,
+                ):
                     new += 1
                 if page.get("links"):
                     hop_pool.append((w, page["links"]))
@@ -1680,10 +1813,31 @@ Guidelines:
             # --- Multi-hop: follow promising in-page links (#8) ---
             hops = self.valves.MAX_LINK_HOPS_PER_CYCLE
             if hops > 0 and hop_pool:
+                # Rank each fetched page's candidate links independently, then
+                # round-robin across pages (best link of every page first, then
+                # each page's second, …) up to the global `hops` budget. A greedy
+                # first-page-wins fill would let one link-heavy page consume the
+                # whole budget and starve links from pages 2..N; round-robin
+                # spreads the hops across this cycle's sources.
+                ranked_per_page = [
+                    (w, _select_links(links, w["query"], seen_urls, hops))
+                    for w, links in hop_pool
+                ]
                 chosen: List[Tuple[Dict, str]] = []
-                for w, links in hop_pool:
-                    for href in _select_links(links, w["query"], seen_urls, hops):
-                        seen_urls.add(_dedup_key(href))
+                picked: set = set()
+                depth_cols = max((len(r) for _, r in ranked_per_page), default=0)
+                for col in range(depth_cols):
+                    for w, ranked in ranked_per_page:
+                        if col >= len(ranked):
+                            continue
+                        href = ranked[col]
+                        key = _dedup_key(href)
+                        # Skip cross-page duplicates and anything already seen;
+                        # `_select_links` only de-duped within its own page.
+                        if key in seen_urls or key in picked:
+                            continue
+                        picked.add(key)
+                        seen_urls.add(key)
                         chosen.append((w, href))
                         if len(chosen) >= hops:
                             break
@@ -1701,7 +1855,10 @@ Guidelines:
                         if isinstance(page, Exception) or not page:
                             continue
                         link_r = {"title": "", "url": page.get("url", href), "published_date": None}
-                        if self._absorb(collected, source_urls, w, link_r, page, depth=1):
+                        if await self._absorb(
+                            collected, source_urls, w, link_r, page, depth=1,
+                            request=request, user=user,
+                        ):
                             new += 1
 
             await self._emit_status(
@@ -1710,11 +1867,44 @@ Guidelines:
                 f"(total {len(collected)} · {len(source_urls)} sources)",
             )
 
+            # --- Proactive thread-pulling: spawn follow-ups from new findings ---
+            # Generated before the structural stop so threads can run; skipped on
+            # the final cycle (they'd never execute). new_items is sliced before
+            # compression rewrites `collected`.
+            new_items = collected[cycle_start:]
+            if (
+                self.valves.FOLLOWUP_QUERIES_PER_CYCLE > 0
+                and new_items
+                and cycle < self.valves.MAX_RESEARCH_CYCLES
+            ):
+                await self._emit_status(
+                    emitter, "🧵 Pulling threads from new findings…"
+                )
+                existing = {
+                    (w["section"].lower(), w["query"].lower()) for w in work
+                }
+                added = 0
+                for f in await self._followup_queries(
+                    query, new_items, plan, request, user
+                ):
+                    k = (f["section"].lower(), f["query"].lower())
+                    if k in existing:
+                        continue
+                    existing.add(k)
+                    work.append({**f, "done": False})
+                    added += 1
+                if added:
+                    await self._emit_status(
+                        emitter, f"🧵 +{added} follow-up queries from sources"
+                    )
+
             # --- Relevance-aware compression (#5) ---
             tw = sum(len(s["content"].split()) for s in collected)
             if tw > self.valves.MAX_TOTAL_CONTEXT_WORDS:
                 await self._emit_status(emitter, "📦 Compressing low-relevance notes…")
-                collected = await self._compress(query, collected, request, user)
+                collected = await self._compress(
+                    query, collected, request, user, recency=recency
+                )
 
             # --- Structural stop: every section meets its coverage target (#4) ---
             cov = self._section_coverage(collected, section_titles)
@@ -1735,7 +1925,164 @@ Guidelines:
 
         return collected, source_urls
 
-    def _absorb(
+    # -----------------------------------------------------------------------
+    # Relevance extraction: embedding rerank with lexical fallback
+    # -----------------------------------------------------------------------
+    async def _relevance(
+        self, text: str, query: str, request: Any, user: Any
+    ) -> Tuple[str, float]:
+        """Return the passages of `text` most relevant to `query`, plus a 0..1 score.
+
+        When ``EMBEDDING_MODEL`` is set and Open WebUI's embeddings endpoint is
+        reachable, segments are semantically cosine-ranked against the query —
+        this catches synonyms/paraphrases the lexical scorer misses and removes
+        the need for the lexical scorer's head-of-page fallback. On any failure
+        (endpoint unconfigured, request error, malformed vectors) it transparently
+        falls back to the built-in lexical (keyword-overlap) scorer.
+        """
+        if self.valves.EMBEDDING_MODEL:
+            embedded = await self._extract_relevant_embed(
+                text, query, self.valves.SNIPPET_MAX_WORDS, request, user
+            )
+            if embedded is not None:
+                return embedded
+        return _extract_relevant(text, query, self.valves.SNIPPET_MAX_WORDS)
+
+    async def _extract_relevant_embed(
+        self,
+        text: str,
+        query: str,
+        max_words: int,
+        request: Any,
+        user: Any,
+        *,
+        scan_max: int = _RELEVANCE_SCAN_MAX_WORDS,
+    ) -> Optional[Tuple[str, float]]:
+        """Embedding-ranked counterpart of ``_extract_relevant`` (or ``None``).
+
+        Segments are scored by cosine similarity between their embedding and the
+        query's, the most-similar ones are reassembled in document order up to
+        `max_words`, and the score is the best segment's similarity clamped to
+        0..1 (comparable across sources, like the lexical coverage score, so it
+        drives retention/compression/ordering the same way). Returns ``None`` to
+        signal the caller to fall back to lexical when the text yields no
+        segments or the embeddings endpoint can't be used.
+        """
+        words = (text or "").split()
+        if not words:
+            return "", 0.0
+        if scan_max > 0 and len(words) > scan_max:
+            text = " ".join(words[:scan_max])
+
+        segs = _segments(text)
+        if not segs or not (query or "").strip():
+            return None
+
+        vectors = await self._embed([query] + segs, request, user)
+        if not vectors or len(vectors) != len(segs) + 1:
+            return None
+
+        qv = vectors[0]
+        scored = [
+            (_cosine(qv, sv), i, seg)
+            for i, (sv, seg) in enumerate(zip(vectors[1:], segs))
+        ]
+        # Best segments by similarity, then restore document order for readability.
+        scored.sort(key=lambda t: t[0], reverse=True)
+        top_sim = scored[0][0] if scored else 0.0
+        chosen: List[Tuple[int, str]] = []
+        budget = 0
+        for sim, idx, seg in scored:
+            wc = len(seg.split())
+            if max_words > 0 and budget + wc > max_words and chosen:
+                break
+            chosen.append((idx, seg))
+            budget += wc
+            if max_words > 0 and budget >= max_words:
+                break
+
+        chosen.sort(key=lambda t: t[0])
+        passages = "\n".join(seg for _, seg in chosen)
+        score = max(0.0, min(1.0, top_sim))
+        return passages, score
+
+    async def _embed(
+        self, texts: List[str], request: Any, user: Any
+    ) -> Optional[List[List[float]]]:
+        """Embed `texts` via Open WebUI's configured embeddings endpoint.
+
+        Returns a list of vectors (one per input) aligned with `texts`, or
+        ``None`` if embeddings are disabled/unconfigured or anything fails — the
+        caller then uses the lexical scorer. For the API-backed RAG engines
+        (openai/ollama/azure_openai) the ``EMBEDDING_MODEL`` valve's model ID is
+        used directly; for the local engine Open WebUI's already-built embedding
+        function (its configured model) is used.
+        """
+        if not self.valves.EMBEDDING_MODEL or request is None or not texts:
+            return None
+        try:
+            cfg = request.app.state.config
+            engine = (getattr(cfg, "RAG_EMBEDDING_ENGINE", "") or "").lower()
+            if engine in ("openai", "ollama", "azure_openai"):
+                from open_webui.retrieval.utils import generate_embeddings
+
+                if engine == "openai":
+                    url = getattr(cfg, "RAG_OPENAI_API_BASE_URL", "")
+                    key = getattr(cfg, "RAG_OPENAI_API_KEY", "")
+                elif engine == "ollama":
+                    url = getattr(cfg, "RAG_OLLAMA_BASE_URL", "")
+                    key = getattr(cfg, "RAG_OLLAMA_API_KEY", "")
+                else:
+                    url = getattr(cfg, "RAG_AZURE_OPENAI_BASE_URL", "")
+                    key = getattr(cfg, "RAG_AZURE_OPENAI_API_KEY", "")
+                vectors = await generate_embeddings(
+                    engine=engine,
+                    model=self.valves.EMBEDDING_MODEL,
+                    text=texts,
+                    prefix=None,
+                    url=url,
+                    key=key,
+                    user=user,
+                    azure_api_version=getattr(
+                        cfg, "RAG_AZURE_OPENAI_API_VERSION", None
+                    ),
+                )
+            else:
+                # Local engine (or unknown): use the embedding function Open WebUI
+                # already built from its RAG configuration.
+                ef = getattr(request.app.state, "EMBEDDING_FUNCTION", None)
+                if ef is None:
+                    return self._embed_fallback(None)
+                vectors = await ef(texts, user=user)
+
+            if (
+                isinstance(vectors, list)
+                and len(vectors) == len(texts)
+                and all(isinstance(v, list) and v for v in vectors)
+            ):
+                return vectors
+            return self._embed_fallback(None)
+        except Exception as e:
+            return self._embed_fallback(e)
+
+    def _embed_fallback(self, err: Optional[Exception]) -> None:
+        """Log the lexical fallback once per process, then return ``None``."""
+        if not self._embed_fallback_logged:
+            self._embed_fallback_logged = True
+            if err is not None:
+                log.info(
+                    "Embedding rerank unavailable (%s); falling back to the "
+                    "lexical scorer.",
+                    err,
+                )
+            else:
+                log.info(
+                    "Embeddings endpoint not configured/usable; falling back to "
+                    "the lexical scorer."
+                )
+        return None
+
+    async def _absorb(
         self,
         collected: List[Dict],
         source_urls: List[str],
@@ -1744,11 +2091,13 @@ Guidelines:
         page: Dict,
         *,
         depth: int,
+        request: Any,
+        user: Any,
     ) -> bool:
         """Relevance-extract a fetched page and, if useful, append it to
         `collected` with full attribution (#1, #2, #9). Returns True if kept."""
-        passages, score = _extract_relevant(
-            page.get("text", ""), work_item["query"], self.valves.SNIPPET_MAX_WORDS
+        passages, score = await self._relevance(
+            page.get("text", ""), work_item["query"], request, user
         )
         # Drop empty/blocked shells, but keep concise factual passages — the
         # content is already relevance-filtered, so a small floor suffices (the
@@ -1829,17 +2178,129 @@ Guidelines:
                 out.append({"section": t, "desc": sec_map.get(t, ""), "query": f"{query} {t}"})
         return out
 
+    async def _followup_queries(
+        self,
+        query: str,
+        new_items: List[Dict],
+        plan: Dict,
+        request: Any,
+        user: Any,
+    ) -> List[Dict[str, str]]:
+        """Spawn follow-up searches from what the latest passages actually say.
+
+        A cheap LLM pass reads the cycle's freshly-gathered passages and names the
+        specific entities/claims (a pivotal study, dataset, person, organisation,
+        or counter-claim) that deserve their own search — letting the loop pull
+        threads rather than only execute the fixed plan. Returns up to
+        ``FOLLOWUP_QUERIES_PER_CYCLE`` ``{section, desc, query}`` items attributed
+        to the most relevant planned section (falling back to "General"); ``[]``
+        when nothing warrants follow-up or the model returns nothing usable.
+        """
+        limit = self.valves.FOLLOWUP_QUERIES_PER_CYCLE
+        if limit <= 0 or not new_items:
+            return []
+        sec_map = {
+            (s.get("title") or "").strip(): s.get("description", "") or ""
+            for s in plan.get("sections", []) or []
+        }
+        section_list = ", ".join(t for t in sec_map) or "General"
+
+        # Compact digest of the new findings (title + extracted passage), capped
+        # so this stays a cheap pass regardless of how much was gathered.
+        notes: List[str] = []
+        budget = 6000
+        for s in new_items:
+            if s.get("url") == "compressed_summary":
+                continue
+            chunk = f"- {s.get('title') or s.get('url')}: {s.get('content', '')}"
+            notes.append(chunk[:1200])
+            budget -= len(chunk[:1200])
+            if budget <= 0:
+                break
+        if not notes:
+            return []
+
+        raw = await self._llm_call(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Research topic: {query}\n\n"
+                        "Below are notes just gathered. Identify the most "
+                        "promising NEW threads worth a dedicated follow-up web "
+                        "search — a specific named study/paper, dataset, person, "
+                        "organisation, event, statistic, or a counter-claim that "
+                        "should be checked. Ignore generic restatements of the "
+                        "topic. For each, write a focused search query.\n\n"
+                        f"Notes:\n{chr(10).join(notes)}\n\n"
+                        f"Attribute each to the single most relevant section from: "
+                        f"{section_list}.\n"
+                        f"Return up to {limit} items as ONLY a JSON array of "
+                        'objects: [{"section":"<section title>","query":'
+                        '"<search query>"}]. Return [] if nothing genuinely '
+                        "warrants a follow-up."
+                    ),
+                }
+            ],
+            request,
+            user,
+            temperature=0.4,
+            max_tokens=500,
+        )
+        data = _extract_json(raw)
+        out: List[Dict[str, str]] = []
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                q = str(item.get("query", "")).strip()
+                if not q:
+                    continue
+                sec = str(item.get("section", "")).strip()
+                if sec not in sec_map:
+                    sec = "General"
+                out.append({"section": sec, "desc": sec_map.get(sec, ""), "query": q})
+                if len(out) >= limit:
+                    break
+        return out
+
+    @staticmethod
+    def _relevance_key(recency: str) -> Callable[[Dict], Tuple[float, float]]:
+        """Sort key ``(score, freshness)`` for ranking sources by relevance.
+
+        On a time-sensitive topic (`recency` set) the second element is the
+        source's publish timestamp so equal-relevance sources rank fresher-first;
+        otherwise it's 0.0 and a stable sort preserves the original order.
+        """
+        def key(s: Dict) -> Tuple[float, float]:
+            score = float(s.get("score", 0.0) or 0.0)
+            if not recency:
+                return (score, 0.0)
+            dt = _parse_date(s.get("published_date"))
+            return (score, dt.timestamp() if dt else 0.0)
+
+        return key
+
     async def _compress(
-        self, query: str, collected: List[Dict], request: Any, user: Any
+        self,
+        query: str,
+        collected: List[Dict],
+        request: Any,
+        user: Any,
+        *,
+        recency: str = "",
     ) -> List[Dict[str, Any]]:
         """Shrink the running context by keeping the highest-relevance sources
         verbatim and summarizing the rest (#5) — relevance-aware, unlike the old
         keep-the-recent-half approach. Section attribution and citation URLs of
-        the summarized sources are preserved."""
-        # Keep prior summaries as-is; rank the rest by relevance score.
+        the summarized sources are preserved. When `recency` is set (a time-
+        sensitive topic), equal-relevance sources are kept fresher-first so the
+        verbatim survivors skew recent."""
+        # Keep prior summaries as-is; rank the rest by relevance score, breaking
+        # ties toward fresher sources on time-sensitive topics.
         prior_summaries = [s for s in collected if s.get("url") == "compressed_summary"]
         real = [s for s in collected if s.get("url") != "compressed_summary"]
-        ranked = sorted(real, key=lambda s: s.get("score", 0.0), reverse=True)
+        ranked = sorted(real, key=self._relevance_key(recency), reverse=True)
 
         budget = max(1, self.valves.MAX_TOTAL_CONTEXT_WORDS // 2)
         keep_ids: set = set()
@@ -1890,15 +2351,19 @@ Guidelines:
     # Phase 3 — final report
     # -----------------------------------------------------------------------
     def _build_source_index(
-        self, collected: List[Dict]
+        self, collected: List[Dict], recency: str = ""
     ) -> Tuple[List[Dict], str]:
         """Assign one global ``[n]`` number to each source and build the shared
         citation list. Sources past REPORT_CONTEXT_MAX_CHARS are dropped from
         BOTH the data and the references, so a citation can never point at a
-        source the model wasn't shown. Returns ``(indexed, refs)`` where each
-        `indexed` entry is ``{idx, src, block}`` (block = the SOURCE-n text)."""
+        source the model wasn't shown. Each source's publish date (when known) is
+        shown in its data block and reference line, and — on a time-sensitive
+        topic (`recency` set) — clearly old sources are flagged ``may be
+        outdated``. Returns ``(indexed, refs)`` where each `indexed` entry is
+        ``{idx, src, block}`` (block = the SOURCE-n text)."""
         source_cap = self.valves.REPORT_SOURCE_MAX_CHARS
         ctx_budget = self.valves.REPORT_CONTEXT_MAX_CHARS
+        now = datetime.utcnow()
 
         indexed: List[Dict] = []
         ref_lines: List[str] = []
@@ -1909,9 +2374,13 @@ Guidelines:
             if source_cap > 0:
                 content = content[:source_cap]
             idx = n + 1
+            dt = _parse_date(s.get("published_date"))
+            stale = _is_stale(dt, recency, now)
+            date_str = dt.strftime("%Y-%m-%d") if dt else ""
+            block_date = f" [published {date_str}]" if date_str else ""
             block = (
                 f"\n--- SOURCE {idx}: {s.get('title') or s.get('url')} "
-                f"({s.get('url')}) ---\n{content}\n"
+                f"({s.get('url')}){block_date} ---\n{content}\n"
             )
             if ctx_budget > 0 and n > 0 and used + len(block) > ctx_budget:
                 break
@@ -1925,7 +2394,11 @@ Guidelines:
                     + (": " + "; ".join(covered) if covered else "")
                 )
             else:
-                ref_lines.append(f"[{idx}] {s.get('url')}")
+                ref = f"[{idx}] {s.get('url')}"
+                if date_str:
+                    ref += f" (published {date_str}"
+                    ref += " — may be outdated)" if stale else ")"
+                ref_lines.append(ref)
         if len(collected) - n > 0:
             log.info(
                 "Report context budget reached: included %d of %d sources",
@@ -1945,7 +2418,9 @@ Guidelines:
         emitter: Optional[Callable],
     ) -> str:
         await self._emit_status(emitter, "📝 Writing final report…")
-        indexed, refs = self._build_source_index(collected)
+        indexed, refs = self._build_source_index(
+            collected, self._plan_recency(plan)
+        )
 
         mode = (self.valves.REPORT_MODE or "sectioned").strip().lower()
         if mode == "single" or not plan.get("sections"):
