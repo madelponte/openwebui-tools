@@ -1,7 +1,7 @@
 """
 title: Deep Research
 author: mdelponte
-version: 2.4.0
+version: 2.5.0
 license: MIT
 description: >
     A deep research pipe that takes a user query, generates a research plan,
@@ -13,19 +13,27 @@ description: >
     sensitive. The report is written section by section against each section's
     own sources under one global citation index. Fetching mirrors the companion
     fetch_page MCP tool's resilient ladder: Apache Tika for PDF/Office/
-    OpenDocument/RTF/EPUB documents, bot-wall/CAPTCHA/429 detection that
-    re-renders through FlareSolverr, a Wayback Machine fallback for pages
-    that stay blocked or render empty, and YouTube transcript extraction.
+    OpenDocument/RTF/EPUB documents (detected by content-type, extension, or a
+    magic-byte sniff so mislabelled binaries aren't decoded as garbage), bot-wall/
+    CAPTCHA/429 detection that re-renders through FlareSolverr, a Wayback Machine
+    fallback for pages that stay blocked or render empty, and YouTube transcript
+    extraction. Every fetch is SSRF-guarded (each URL and redirect hop must
+    resolve to a public address), charset-decoded like a browser, and bounded by
+    a download-size cap.
 required_open_webui_version: 0.9.0
 """
 
 import asyncio
+import codecs
+import ipaddress
 import json
 import logging
 import math
 import re
+import socket
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from urllib.parse import (
     urlparse,
     urlunparse,
@@ -46,6 +54,17 @@ from typing import (
 
 import aiohttp
 from pydantic import BaseModel, Field
+
+# Charset detection mirrors the fetch_page MCP tool: BeautifulSoup's
+# UnicodeDammit gives statistical encoding detection for pages that declare no
+# charset. It ships with Open WebUI, but the pipe treats it as optional — if it's
+# missing we fall back to the declared charset / UTF-8 path in `_decode_body`.
+try:
+    from bs4 import UnicodeDammit
+
+    _UNICODE_DAMMIT = UnicodeDammit
+except Exception:  # pragma: no cover - import guard
+    _UNICODE_DAMMIT = None  # type: ignore
 
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.misc import pop_system_message, get_last_user_message
@@ -104,7 +123,10 @@ _DONE_MARKER = "\n\n---DEEP-RESEARCH-COMPLETE---"
 # and Akamai Bot Manager all serve a 403 (sometimes a 200) whose body is a
 # JS/CAPTCHA challenge with none of the Cloudflare markers, so they're matched
 # explicitly or the fallback never fires.
-BLOCK_STATUS_CODES = {403, 503, 520, 521, 522, 523, 524, 525, 526, 527}
+# 401 is included because DataDome (e.g. Reuters) answers its interstitial with
+# HTTP 401; a plain 401 with no challenge marker still falls through as not-blocked
+# because `_is_blocked_response`'s marker check must also pass.
+BLOCK_STATUS_CODES = {401, 403, 503, 520, 521, 522, 523, 524, 525, 526, 527}
 CLOUDFLARE_MARKERS = (
     "cf-ray",
     "cf-chl",
@@ -115,6 +137,10 @@ CLOUDFLARE_MARKERS = (
     "challenge-platform",
     "please enable cookies",
     "/cdn-cgi/challenge-platform",
+    # Cloudflare's managed-challenge interstitial doesn't always carry a "just a
+    # moment" title or a cf-* token in a stripped response — but its visible body
+    # text is this. The >=2-marker rule still guards the bare-200 case.
+    "enable javascript and cookies to continue",
 )
 CHALLENGE_MARKERS = (
     "px-cloud.net",
@@ -197,6 +223,212 @@ _TRACKING_PARAMS = frozenset(
         "_hsmi",
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# SSRF guard (ported from the fetch_page MCP tool)
+#
+# URLs reach the pipe from search results and from in-page links it follows
+# (multi-hop), so an attacker can use indirect prompt injection to steer a fetch
+# at internal targets — cloud metadata (169.254.169.254), localhost, or LAN
+# hosts. Every URL — and every redirect hop — is resolved and refused unless it
+# is publicly routable. Operators can opt specific hosts/IPs/CIDRs back in via
+# the SSRF_ALLOWLIST valve.
+# ---------------------------------------------------------------------------
+
+MAX_REDIRECTS = 20
+
+
+class SSRFError(RuntimeError):
+    """A fetch target's host resolved to a non-public (blocked) address."""
+
+
+class DownloadTooLargeError(RuntimeError):
+    """A response body exceeded the configured download-size cap."""
+
+
+@lru_cache(maxsize=8)
+def _parse_allowlist(raw: str) -> Tuple[frozenset, Tuple]:
+    """Parse the SSRF allowlist string into (hostnames, ip-networks).
+
+    Entries are comma/whitespace-separated; each is either an IP/CIDR (matched
+    against resolved addresses) or a hostname (matched verbatim against the URL
+    host, case-insensitive). Cached since the valve string is a fixed value.
+    """
+    hosts: set = set()
+    nets: list = []
+    for item in re.split(r"[,\s]+", (raw or "").strip()):
+        if not item:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            hosts.add(item.lower())
+    return frozenset(hosts), tuple(nets)
+
+
+def _ip_of(addr: str):
+    """Parse a resolved address into an ip_address, unwrapping IPv4-mapped IPv6
+    (e.g. ::ffff:169.254.169.254) so the v4 rules apply. None if unparseable."""
+    try:
+        ip = ipaddress.ip_address(addr.split("%")[0])  # drop any IPv6 scope id
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip
+
+
+def _addr_is_blocked(addr: str, allowed_nets: Tuple = ()) -> bool:
+    """True if `addr` is not a globally-routable public IP (loopback, private,
+    link-local, reserved, CGNAT, …) and not covered by an allowlisted network —
+    or unparseable, in which case refuse."""
+    ip = _ip_of(addr)
+    if ip is None:
+        return True
+    if ip.is_global:
+        return False
+    return not any(ip.version == n.version and ip in n for n in allowed_nets)
+
+
+async def _assert_url_allowed(url: str, allowlist: str = "") -> None:
+    """Raise SSRFError unless `url` is http(s) and its host is allowed: either
+    explicitly allowlisted, or resolving only to public addresses. DNS
+    resolution is offloaded so the event loop isn't blocked."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise SSRFError(f"Refusing non-http(s) URL: {url!r}")
+    host = parsed.hostname or ""
+    if not host:
+        raise SSRFError(f"Refusing URL with no host: {url!r}")
+    allowed_hosts, allowed_nets = _parse_allowlist(allowlist)
+    if host.lower() in allowed_hosts:
+        return
+    literal_ip = _ip_of(host)
+    if literal_ip is not None:
+        if _addr_is_blocked(host, allowed_nets):
+            raise SSRFError(
+                f"Refusing to fetch {host!r}: non-public address (allowlist via "
+                "SSRF_ALLOWLIST)"
+            )
+        return
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except socket.gaierror as e:
+        raise SSRFError(f"Could not resolve host {host!r}: {e}")
+    blocked = sorted(
+        {info[4][0] for info in infos if _addr_is_blocked(info[4][0], allowed_nets)}
+    )
+    if blocked:
+        raise SSRFError(
+            f"Refusing to fetch {host!r}: resolves to non-public address(es) "
+            f"{', '.join(blocked)} (allowlist via SSRF_ALLOWLIST)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Charset-aware decoding (ported from the fetch_page MCP tool)
+#
+# A large slice of the web is served in a non-UTF-8 encoding (Cyrillic
+# windows-1251, Japanese Shift_JIS, Korean EUC-KR, Western windows-1252, …);
+# decoding those blindly as UTF-8 turns every non-ASCII character into a
+# replacement glyph. We resolve the charset like a browser: HTTP Content-Type
+# header, then an in-document <meta charset>, then statistical detection, then
+# UTF-8 as a floor.
+# ---------------------------------------------------------------------------
+
+_CHARSET_PARAM_RE = re.compile(r"charset\s*=\s*([a-zA-Z0-9_\-:.]+)", re.I)
+_META_CHARSET_RE = re.compile(
+    rb"""<meta[^>]+?charset\s*=\s*["']?\s*([a-zA-Z0-9_\-:.]+)""", re.I
+)
+
+
+def _normalize_codec(name: Optional[str]) -> Optional[str]:
+    """Return the canonical codec name if `name` is a real encoding, else None."""
+    if not name:
+        return None
+    try:
+        return codecs.lookup(name.strip().strip("\"'")).name
+    except (LookupError, TypeError, ValueError):
+        return None
+
+
+def _charset_from_ctype(ctype: str) -> Optional[str]:
+    """Extract the ``charset=`` value from a Content-Type header, if any."""
+    m = _CHARSET_PARAM_RE.search(ctype or "")
+    return m.group(1) if m else None
+
+
+def _decode_body(body: bytes, ctype: str) -> str:
+    """Decode page bytes to text using the declared/detected charset.
+
+    Precedence mirrors a browser: (1) the HTTP ``Content-Type`` charset, (2) a
+    ``<meta charset>`` declaration in the document head, (3) UnicodeDammit's
+    statistical detection (when bs4 is available), and (4) UTF-8 with
+    replacement as a floor that never raises.
+    """
+    if not body:
+        return ""
+    header_enc = _normalize_codec(_charset_from_ctype(ctype))
+    meta_match = _META_CHARSET_RE.search(body[:4096])
+    meta_enc = (
+        _normalize_codec(meta_match.group(1).decode("ascii", "ignore"))
+        if meta_match
+        else None
+    )
+
+    # A declared charset that actually decodes the bytes cleanly wins outright.
+    for enc in (header_enc, meta_enc):
+        if enc:
+            try:
+                return body.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                pass
+
+    # Otherwise let UnicodeDammit detect (preferring the declared encodings as
+    # overrides and handling BOMs / Microsoft smart-quote bytes), when available.
+    if _UNICODE_DAMMIT is not None:
+        overrides = [e for e in (header_enc, meta_enc) if e]
+        try:
+            dammit = _UNICODE_DAMMIT(body, override_encodings=overrides, is_html=True)
+            if dammit.unicode_markup is not None:
+                return dammit.unicode_markup
+        except Exception:
+            pass
+
+    return body.decode("utf-8", errors="replace")
+
+
+def _sniff_document_bytes(body: Optional[bytes]) -> bool:
+    """True if the leading bytes look like a Tika-extractable binary document.
+
+    The last line of defence when neither the content-type nor the URL extension
+    reveals the type — e.g. a PDF served as ``application/octet-stream`` (or even
+    mislabelled ``text/html``) from an extensionless ``/download?id=`` URL.
+    Without this the binary would be decoded into garbage and returned as page
+    text. Only unambiguous signatures are matched; a plain ZIP is accepted only
+    when it carries an Office/OpenDocument/EPUB marker, never as a bare archive.
+    """
+    if not body:
+        return False
+    head = body[:8]
+    if head.startswith(b"%PDF"):
+        return True
+    if head.startswith(b"{\\rtf"):
+        return True
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):  # OLE2: legacy doc/xls/ppt
+        return True
+    if head.startswith(b"PK\x03\x04"):
+        # A ZIP container — only a document if it's an OOXML/ODF/EPUB package.
+        sample = body[:2000]
+        return (
+            b"word/" in sample
+            or b"xl/" in sample
+            or b"ppt/" in sample
+            or b"mimetypeapplication/epub+zip" in sample
+            or b"mimetypeapplication/vnd.oasis.opendocument" in sample
+        )
+    return False
 
 
 def _extract_json(raw: str) -> Any:
@@ -731,6 +963,28 @@ class Pipe:
             default=5,
             description="Max pages to fetch concurrently.",
         )
+        MAX_DOWNLOAD_BYTES: int = Field(
+            default=104857600,  # 100 MiB
+            description=(
+                "Maximum bytes a single page fetch may download before it is "
+                "aborted (0 = unbounded). The cap is on the decompressed stream, "
+                "so it also bounds a decompression bomb, protecting the process "
+                "from a multi-GB body exhausting memory. Sized for the largest "
+                "reasonable document (an image-heavy PDF, which Tika reduces to "
+                "plain text)."
+            ),
+        )
+        SSRF_ALLOWLIST: str = Field(
+            default="",
+            description=(
+                "Comma/space-separated hosts, IPs, or CIDRs that bypass the SSRF "
+                "guard so the pipe may reach a trusted local/private page you host "
+                "(e.g. 'localhost,127.0.0.1,192.168.1.50,10.0.0.0/8'). Applies to "
+                "redirect targets too. Empty = block all non-public addresses. "
+                "Note: your SearXNG/FlareSolverr/Tika service hosts are contacted "
+                "directly and are not subject to this guard."
+            ),
+        )
         VERIFY_SSL: bool = Field(
             default=True,
             description=(
@@ -999,6 +1253,49 @@ class Pipe:
                 return True
         return False
 
+    async def _http_get(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> Tuple[int, Dict[str, str], bytes, str]:
+        """SSRF-guarded GET with manual redirect following and a download cap.
+
+        Returns ``(status, headers, body_bytes, content_type)``. Redirects are
+        followed by hand (not aiohttp's ``allow_redirects``) so each hop's target
+        passes the SSRF guard before we connect to it. The body is streamed and
+        aborted once it passes ``MAX_DOWNLOAD_BYTES`` (0 = unbounded). Raises
+        ``SSRFError`` (initial URL or a redirect hop resolved to a non-public
+        address) or ``DownloadTooLargeError``; other failures propagate as the
+        underlying aiohttp exception.
+        """
+        await _assert_url_allowed(url, self.valves.SSRF_ALLOWLIST)
+        max_bytes = self.valves.MAX_DOWNLOAD_BYTES
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            async with session.get(
+                current,
+                headers=self._BROWSER_HEADERS,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
+                ssl=self.valves.VERIFY_SSL,
+            ) as resp:
+                location = resp.headers.get("Location")
+                if resp.status in (301, 302, 303, 307, 308) and location:
+                    current = urljoin(current, location)
+                    await _assert_url_allowed(current, self.valves.SSRF_ALLOWLIST)
+                    continue
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if max_bytes and total > max_bytes:
+                        raise DownloadTooLargeError(
+                            f"Response from {current!r} exceeds the "
+                            f"{max_bytes}-byte download cap (MAX_DOWNLOAD_BYTES)."
+                        )
+                    chunks.append(chunk)
+                ctype = resp.headers.get("Content-Type", "")
+                return resp.status, dict(resp.headers), b"".join(chunks), ctype
+        raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
+
     async def _fetch_page(
         self, session: aiohttp.ClientSession, url: str
     ) -> Dict[str, Any]:
@@ -1014,6 +1311,16 @@ class Pipe:
         in-page links (HTML fetches only) for multi-hop following.
         """
         cap = _RELEVANCE_SCAN_MAX_WORDS
+
+        # SSRF guard up front, before ANY fetch path (Reddit JSON, FlareSolverr,
+        # the direct GET): the URL came from a search result or a followed
+        # in-page link, so refuse a non-public target rather than handing it to a
+        # fetcher. (Redirect hops are re-checked inside `_http_get`.)
+        try:
+            await _assert_url_allowed(url, self.valves.SSRF_ALLOWLIST)
+        except SSRFError as e:
+            log.debug(f"SSRF-blocked URL {url}: {e}")
+            return self._page(url, "", kind="blocked")
 
         # Reddit serves anti-bot HTML; route through its public .json endpoint.
         if self._is_reddit_url(url):
@@ -1033,29 +1340,28 @@ class Pipe:
         is_doc = False
         body_bytes = b""
         try:
-            async with session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
-                headers=self._BROWSER_HEADERS,
-                allow_redirects=True,
-                ssl=self.valves.VERIFY_SSL,
-            ) as resp:
-                status = resp.status
-                headers = dict(resp.headers)
-                ct = resp.headers.get("Content-Type", "")
-                # Route binary documents (PDF/Office/OpenDocument/RTF/EPUB) to
-                # Tika regardless of status code; everything else is read as text
-                # so block detection can inspect the body.
-                if self._is_tika_document(ct, url):
-                    body_bytes = await resp.read()
-                    is_doc = True
-                else:
-                    raw_html = await resp.text(errors="replace")
+            status, headers, body_bytes, ct = await self._http_get(session, url)
+            # Route binary documents (PDF/Office/OpenDocument/RTF/EPUB) to Tika —
+            # detected by content-type/extension OR a magic-byte sniff, which also
+            # catches a document mislabelled as text/html or octet-stream.
+            # Everything else is charset-decoded so block detection, link
+            # extraction, and text rendering see correctly-decoded characters
+            # rather than a blind UTF-8 reading that garbles non-UTF-8 pages.
+            if self._is_tika_document(ct, url) or _sniff_document_bytes(body_bytes):
+                is_doc = True
+            else:
+                raw_html = _decode_body(body_bytes, ct)
+        except (SSRFError, DownloadTooLargeError) as e:
+            # A redirect hop resolved to a blocked host, or the body blew past the
+            # size cap — refuse outright rather than re-fetching the same URL
+            # through FlareSolverr (a real browser that would re-download it).
+            log.debug(f"Refusing {url}: {e}")
+            return self._page(url, "", kind="blocked")
         except Exception as e:
             log.debug(f"Direct fetch failed for {url}: {e}")
 
         if is_doc:
-            extracted = await self._extract_document(body_bytes)
+            extracted = await self._extract_document(session, body_bytes)
             return self._page(url, self._cap_words(extracted, cap), kind="document")
 
         blocked = self._is_blocked_response(status, raw_html, headers) if status else False
@@ -1350,31 +1656,35 @@ class Pipe:
             text = text.replace(ent, ch)
         return re.sub(r"\s+", " ", text).strip()
 
-    async def _extract_document(self, data: bytes) -> str:
+    async def _extract_document(
+        self, session: aiohttp.ClientSession, data: bytes
+    ) -> str:
         """Extract plain text from a document byte stream via Apache Tika.
 
         No Content-Type is sent: Tika auto-detects the format from the bytes, so
         this one path handles PDF, Office (doc/docx/xls/xlsx/ppt/pptx),
         OpenDocument, RTF and EPUB. ``X-Tika-PDFOcrStrategy: no_ocr`` keeps it to
         embedded text (fast; avoids OCR of image-heavy PDFs blowing the timeout).
+
+        Reuses the run's shared `session` rather than standing up a fresh
+        ``ClientSession`` (and connector) per document.
         """
         if not data:
             return "[Document returned no content]"
         try:
             tika_url = f"{self.valves.TIKA_URL.rstrip('/')}/tika"
-            async with aiohttp.ClientSession() as session:
-                async with session.put(
-                    tika_url,
-                    data=data,
-                    headers={
-                        "Accept": "text/plain",
-                        "X-Tika-PDFOcrStrategy": "no_ocr",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as resp:
-                    resp.raise_for_status()
-                    text = (await resp.text()).strip()
-                    return text if text else "[Document contained no extractable text]"
+            async with session.put(
+                tika_url,
+                data=data,
+                headers={
+                    "Accept": "text/plain",
+                    "X-Tika-PDFOcrStrategy": "no_ocr",
+                },
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                resp.raise_for_status()
+                text = (await resp.text()).strip()
+                return text if text else "[Document contained no extractable text]"
         except Exception as e:
             return f"[Document extraction failed: {e}]"
 
@@ -1422,20 +1732,15 @@ class Pipe:
 
         snapshot_url = f"https://web.archive.org/web/{ts}id_/{url}"
         try:
-            async with session.get(
-                snapshot_url,
-                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
-                headers=self._BROWSER_HEADERS,
-                allow_redirects=True,
-                ssl=self.valves.VERIFY_SSL,
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                ct = resp.headers.get("Content-Type", "")
-                if self._is_tika_document(ct, url):
-                    text = await self._extract_document(await resp.read())
-                else:
-                    text = self._html_to_text(await resp.text(errors="replace"))
+            status, _headers, body, ct = await self._http_get(session, snapshot_url)
+            if status != 200:
+                return None
+            # Same document-vs-text branching as the live fetch: a snapshot can be
+            # an archived PDF/Office doc, mislabelled bytes, or a non-UTF-8 page.
+            if self._is_tika_document(ct, url) or _sniff_document_bytes(body):
+                text = await self._extract_document(session, body)
+            else:
+                text = self._html_to_text(_decode_body(body, ct))
         except Exception as e:
             log.debug(f"Wayback snapshot fetch failed for {snapshot_url}: {e}")
             return None
@@ -1585,9 +1890,14 @@ class Pipe:
             exploratory.append(" ".join(words[:4]) + " overview")
         exploratory.append(query + " recent developments")
 
+        # Run the exploratory searches concurrently — they're independent, so
+        # firing them together pays one SearXNG round-trip instead of three.
+        searched = await asyncio.gather(
+            *[self._search(session, eq) for eq in exploratory[:3]]
+        )
         snippets: List[str] = []
-        for eq in exploratory[:3]:
-            for r in (await self._search(session, eq))[:5]:
+        for hits in searched:
+            for r in hits[:5]:
                 if r["snippet"]:
                     snippets.append(
                         f"- [{r['title']}]({r['url']}): " f"{r['snippet'][:200]}"
@@ -1770,10 +2080,24 @@ Guidelines:
                 w["done"] = True
 
             # --- Search (#9 recency, normalized de-dup) ---
+            # Run this cycle's queries concurrently rather than one-after-another;
+            # each is an independent SearXNG round-trip. De-dup is applied serially
+            # over the gathered results, in batch order, so the kept set is
+            # identical to the old sequential version.
+            await self._emit_status(
+                emitter,
+                f"🔍 Searching {len(batch)} queries: "
+                + ", ".join(w["query"][:40] for w in batch),
+            )
+            searched = await asyncio.gather(
+                *[
+                    self._search(session, w["query"], time_range=recency)
+                    for w in batch
+                ]
+            )
             results: List[Tuple[Dict, Dict]] = []  # (work_item, search_result)
-            for w in batch:
-                await self._emit_status(emitter, f"🔍 [{w['section']}] {w['query'][:70]}…")
-                for r in await self._search(session, w["query"], time_range=recency):
+            for w, hits in zip(batch, searched):
+                for r in hits:
                     if not r.get("url"):
                         continue
                     key = _dedup_key(r["url"])
@@ -1799,12 +2123,24 @@ Guidelines:
             new = 0
             cycle_start = len(collected)  # index of this cycle's first new passage
             hop_pool: List[Tuple[Dict, List[Tuple[str, str]]]] = []
-            for (w, r), page in zip(batch_results, fetched):
-                if isinstance(page, Exception) or not page:
-                    continue
-                if await self._absorb(
-                    collected, source_urls, w, r, page, depth=0,
-                    request=request, user=user,
+            valid = [
+                (w, r, page)
+                for (w, r), page in zip(batch_results, fetched)
+                if not isinstance(page, Exception) and page
+            ]
+            # Relevance-extract the whole batch concurrently — with embeddings on,
+            # each extraction is a network round-trip, so overlapping them turns N
+            # serial calls into one. The append (`_record`) is then done serially
+            # in batch order, keeping `collected` deterministic.
+            extracted = await asyncio.gather(
+                *[
+                    self._relevance(page.get("text", ""), w["query"], request, user)
+                    for w, r, page in valid
+                ]
+            )
+            for (w, r, page), (passages, score) in zip(valid, extracted):
+                if self._record(
+                    collected, source_urls, w, r, page, passages, score, depth=0
                 ):
                     new += 1
                 if page.get("links"):
@@ -1851,13 +2187,26 @@ Guidelines:
                         *[fetch(href) for _, href in chosen],
                         return_exceptions=True,
                     )
-                    for (w, href), page in zip(chosen, hopped):
-                        if isinstance(page, Exception) or not page:
-                            continue
+                    valid_hops = [
+                        (w, href, page)
+                        for (w, href), page in zip(chosen, hopped)
+                        if not isinstance(page, Exception) and page
+                    ]
+                    extracted = await asyncio.gather(
+                        *[
+                            self._relevance(
+                                page.get("text", ""), w["query"], request, user
+                            )
+                            for w, href, page in valid_hops
+                        ]
+                    )
+                    for (w, href, page), (passages, score) in zip(
+                        valid_hops, extracted
+                    ):
                         link_r = {"title": "", "url": page.get("url", href), "published_date": None}
-                        if await self._absorb(
-                            collected, source_urls, w, link_r, page, depth=1,
-                            request=request, user=user,
+                        if self._record(
+                            collected, source_urls, w, link_r, page, passages, score,
+                            depth=1,
                         ):
                             new += 1
 
@@ -2082,23 +2431,25 @@ Guidelines:
                 )
         return None
 
-    async def _absorb(
+    def _record(
         self,
         collected: List[Dict],
         source_urls: List[str],
         work_item: Dict,
         result: Dict,
         page: Dict,
+        passages: str,
+        score: float,
         *,
         depth: int,
-        request: Any,
-        user: Any,
     ) -> bool:
-        """Relevance-extract a fetched page and, if useful, append it to
-        `collected` with full attribution (#1, #2, #9). Returns True if kept."""
-        passages, score = await self._relevance(
-            page.get("text", ""), work_item["query"], request, user
-        )
+        """Append an already relevance-extracted page to `collected` with full
+        attribution (#1, #2, #9). Returns True if kept.
+
+        The async relevance extraction is done by the caller (concurrently across
+        a batch); this is the ordered, synchronous append so `collected` stays
+        deterministic regardless of which extraction finished first.
+        """
         # Drop empty/blocked shells, but keep concise factual passages — the
         # content is already relevance-filtered, so a small floor suffices (the
         # old >20-word floor was tuned for whole-page text, not extracts).

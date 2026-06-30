@@ -121,6 +121,8 @@ flaresolverr:
 |---|---|---|
 | `PAGE_FETCH_TIMEOUT` | `15` | Timeout in seconds for fetching individual web pages. |
 | `MAX_CONCURRENT_FETCHES` | `5` | How many pages to download at the same time. Higher values are faster but may trigger rate limits. |
+| `MAX_DOWNLOAD_BYTES` | `104857600` | Maximum bytes a single page fetch may download before it is aborted (`0` = unbounded). The cap is on the decompressed stream, so it also bounds a decompression bomb and protects the process from a multi-GB body exhausting memory. |
+| `SSRF_ALLOWLIST` | `""` (empty) | Comma/space-separated hosts, IPs, or CIDRs that bypass the SSRF guard so the pipe may reach a trusted local/private page you host (e.g. `localhost,127.0.0.1,10.0.0.0/8`). Applies to redirect targets too. Empty = block all non-public addresses. Your SearXNG/FlareSolverr/Tika hosts are contacted directly and are not subject to this guard. |
 | `VERIFY_SSL` | `True` | Verify TLS certificates when fetching pages. Leave on; disable only if you must fetch sources with broken/self-signed certs. |
 
 ### Behaviour
