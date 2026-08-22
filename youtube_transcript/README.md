@@ -12,12 +12,20 @@ Fetch the transcript (subtitles/captions) of a YouTube video so your model can s
 - Built-in support for Webshare residential proxies (for cloud-hosted deployments)
 - Generic HTTP/SOCKS proxy support as a fallback (e.g. Tor)
 
+## Compatibility
+
+- Open WebUI **0.11.0 or later**
+- `youtube-transcript-api` **1.0.0 or later** (current API verified against 1.2.4)
+- A model with native tool calling
+
 ## Installation
 
-1. In Open WebUI, go to **Workspace → Tools → +** (Create new tool).
-2. Paste in the contents of `youtube_transcript.py`.
-3. Save. Open WebUI will auto-install the `youtube-transcript-api` dependency from the frontmatter.
-4. Enable the tool on whichever model(s) you want to use it with.
+1. In Open WebUI, go to **Workspace → Tools** and open **Create**.
+2. Create a tool and paste in the contents of `youtube_transcript.py`.
+3. Save. Open WebUI will auto-install the `youtube-transcript-api>=1.0.0` dependency from the frontmatter.
+4. Add it to a model under **Workspace → Models → Tools**, or enable it per-chat from the composer’s **Integrations** menu.
+
+Native function calling is the default in Open WebUI 0.11. If a model has an explicit override, use **Native**, not Legacy.
 
 ## Usage
 

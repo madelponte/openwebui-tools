@@ -22,13 +22,17 @@ Reddit links continue to be read through Reddit's public `.json` endpoint.
 
 **Phase 3 — Report.** By default (`REPORT_MODE="sectioned"`) each report section is drafted in its own LLM call against **only that section's gathered sources** (plus shared cross-cutting context), then a final synthesis pass writes the title, abstract, and conclusion from the drafted sections. Writing sections independently produces more thorough, better-grounded coverage and scales past a single call's token ceiling. Every source is assigned one **global `[n]` number** that is shared across all section prompts, so a citation always points at the source the model was actually shown — even though sections are written separately. If the research exceeds `REPORT_CONTEXT_MAX_CHARS`, sources past the budget are dropped from both the data and the citation list together (never cited-but-unseen). Set `REPORT_MODE="single"` to fall back to the legacy one-shot report (cheaper, fewer LLM calls). Citations are also emitted as clickable source chips below the message in Open WebUI's interface.
 
+## Compatibility
+
+This version targets Open WebUI **0.11.0 or later**. It uses the 0.11 async per-key configuration API for optional embeddings, the current pipe response lifecycle, and the current event/citation payloads.
+
 ## Installation
 
-1. Go to **Admin Panel → Functions** in Open WebUI.
-2. Click **Add New Function** and paste the contents of `deep_research_pipe.py`.
+1. Go to **Settings → Admin → Functions** in Open WebUI.
+2. Create a function and paste the contents of `deep_research_pipe.py`.
 3. Save and enable the function.
-4. Start a new chat and select **Deep Research** from the model dropdown.
-5. Configure the valves (see below) from the function settings — at minimum set your `SEARXNG_URL` and `RESEARCH_MODEL`.
+4. Configure the function valves (see below). You must set `SEARXNG_URL` and `RESEARCH_MODEL`.
+5. Start a new chat and select **Deep Research** from the model picker in the composer.
 
 ## Requirements
 
@@ -61,7 +65,7 @@ flaresolverr:
 
 | Valve | Default | Description |
 |---|---|---|
-| `RESEARCH_MODEL` | *(empty)* | Model ID for all LLM calls (planning, analysis, report writing). Leave blank to use the system default. Should be a capable model with good instruction-following. |
+| `RESEARCH_MODEL` | *(empty)* | **Required.** Accessible Open WebUI model ID for all LLM calls (planning, analysis, report writing). It cannot be the Deep Research pipe itself. Open WebUI 0.11 has no implicit `default` model ID for internal pipe calls. |
 | `EMBEDDING_MODEL` | *(empty)* | Optional. Enables **semantic** relevance ranking of page passages: the query and each candidate segment are embedded via Open WebUI's configured embeddings endpoint and cosine-ranked, catching synonym/paraphrase matches the lexical scorer misses. For the `openai`/`ollama`/`azure_openai` RAG engines this exact model ID is used; for the local engine Open WebUI's configured embedding model is used. Falls back to the built-in lexical (keyword-overlap) scorer when the endpoint isn't configured or a request fails. Blank = lexical-only (the default; no setup needed). |
 
 ### Search Engine

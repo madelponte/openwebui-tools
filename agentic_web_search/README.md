@@ -17,16 +17,17 @@ flaresolverr is also integrated to bypass captchas which the built in search doe
 - **Structured-data preview** — the top N search results come back with not just title/snippet but also a heading outline and JSON-LD table of contents (recipes, how-tos, articles), so the model can decide what's worth opening before spending tokens on a full page fetch.
 - **Two fetch modes** — plain readable text or structured metadata, model's choice based on what it needs.
 - **Reddit handling** — Reddit URLs are automatically rewritten to the `.json` endpoint and the response is compacted to just `{post, comments}` with depth info.
-- **PDF support** — PDFs are detected by content type or extension and extracted to plain text via `pypdf`.
+- **PDF support** — PDFs are detected by content type or extension and extracted to plain text through Apache Tika.
 - **Citations** — fetched pages show up as proper chat sources you can click through.
-- **Status updates** — works in both Default and Native function-calling modes.
+- **Status updates** — integrates with Open WebUI's current Native function-calling mode.
 
 ## Requirements
 
-- Open WebUI (any reasonably recent version)
+- Open WebUI **0.11.0 or later**
 - A running [SearXNG](https://github.com/searxng/searxng) instance with JSON output enabled
 - *(Optional but recommended)* A running [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) instance for Cloudflare bypass
-- A model with native tool calling for best results (works in Default mode too)
+- A model with native tool calling
+- A running Apache Tika server if PDF extraction is needed
 
 ### SearXNG configuration
 
@@ -43,26 +44,26 @@ Restart SearXNG after editing. If you skip this step, the tool will return a cle
 
 ### Python packages
 
-The tool's frontmatter declares `httpx`, `beautifulsoup4`, `lxml`, and `pypdf` as requirements. Open WebUI will pip-install these on save automatically.
+The tool's frontmatter declares `httpx`, `beautifulsoup4`, and `lxml` as requirements. Open WebUI will pip-install these on save automatically. PDF extraction uses your configured `TIKA_URL` service rather than an in-process Python package.
 
 > **Production note:** if you run Open WebUI with `UVICORN_WORKERS > 1` or in a multi-replica setup, runtime pip installs cause race conditions. Set `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=False` and bake the dependencies into your image:
 > ```dockerfile
 > FROM ghcr.io/open-webui/open-webui:main
-> RUN pip install --no-cache-dir httpx beautifulsoup4 lxml pypdf
+> RUN pip install --no-cache-dir httpx beautifulsoup4 lxml
 > ```
 
 ## Installation
 
 1. Open Open WebUI and go to **Workspace → Tools**.
-2. Click **+** (Create New Tool) or the **Import** button.
+2. Open the **Create** menu and create or import a tool.
 3. Paste the contents of `agentic_web_search.py`, or import the file directly.
 4. Click **Save**. Open WebUI will install the required packages at this point.
-5. Open the tool's settings (gear icon) and configure the **Valves** — at minimum, set `SEARXNG_URL` and `FLARESOLVERR_URL` to point at your instances.
-6. Enable the tool for the models you want to use it with: go to **Workspace → Models**, edit your model, and toggle this tool on. Or enable it per-chat using the **+** button next to the chat input.
+5. Open the tool's settings (gear icon) and configure the **Valves**. Set `SEARXNG_URL`; set `FLARESOLVERR_URL` and `TIKA_URL` only when those optional services are available (leave FlareSolverr blank to disable it).
+6. Enable the tool for the models you want to use it with: go to **Workspace → Models**, edit your model, and toggle this tool on. Or enable it per-chat from the **Integrations** menu in the composer.
 
 ### Recommended model settings
 
-For best results, set the model's **Function Calling** mode to **Native** (Admin Panel → Settings → Models → your model → Advanced Params → Function Calling). This gives the model autonomous control over when to invoke the tools.
+Native function calling is the default and only supported modern mode in Open WebUI 0.11. If the model has an explicit override, set **Function Calling** to **Native** under its advanced parameters rather than Legacy.
 
 ## Valves reference
 
@@ -86,6 +87,12 @@ Valves are configured per-tool in Open WebUI. Admins can edit them; users see th
 |---|---|---|
 | `FLARESOLVERR_URL` | `http://flaresolverr:8191` | Base URL of FlareSolverr. **No trailing `/v1`**. Leave **empty** to disable the Cloudflare fallback entirely. |
 | `FLARESOLVERR_TIMEOUT_MS` | `60000` | The `maxTimeout` value passed to FlareSolverr in milliseconds. Increase for heavily protected sites that take longer to solve. |
+
+### Apache Tika
+
+| Valve | Default | Description |
+|---|---|---|
+| `TIKA_URL` | `http://tika:9998` | Base URL of the Apache Tika server used for PDF text extraction. |
 
 ### HTTP behavior
 
@@ -142,7 +149,7 @@ If the page is Cloudflare-blocked and `FLARESOLVERR_URL` is set, the tool retrie
 
 **`Both direct and FlareSolverr fetches failed`** — Either FlareSolverr isn't running, the URL in `FLARESOLVERR_URL` is wrong, or the page is failing the Cloudflare challenge for a different reason (rate limiting, IP block, etc.). Check the FlareSolverr container logs.
 
-**Tool isn't being called by the model** — Make sure (1) the tool is enabled for the current model or chat, (2) the model supports tool calling, and (3) Function Calling is set to Native or Default in the model's advanced params.
+**Tool isn't being called by the model** — Make sure (1) the tool is enabled for the current model or chat, (2) the model supports tool calling, and (3) Function Calling is set to Native rather than Legacy in the model's advanced params.
 
 **Page content looks garbled** — The site may use heavy client-side JavaScript that the tool can't execute. FlareSolverr will help in some cases (it uses a real browser) but not for SPA-rendered pages that require user interaction.
 

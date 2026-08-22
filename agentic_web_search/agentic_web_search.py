@@ -2,8 +2,9 @@
 title: Agentic Web Search
 author: mdelponte
 author_url: https://github.com/mdelponte
-version: 1.1.0
+version: 1.2.0
 license: MIT
+required_open_webui_version: 0.11.0
 description: Lets the model decide when it needs to search the web, craft its own query, fetch pages, and use structured data. Uses a self-hosted SearXNG instance with optional FlareSolverr fallback for Cloudflare-protected pages. Includes Reddit JSON endpoint handling and PDF support.
 requirements: httpx, beautifulsoup4, lxml
 """
@@ -328,15 +329,19 @@ def _structured_from_html(html: str, url: str) -> dict:
     return result
 
 
-def _pdf_to_text(data: bytes, tika_url: str) -> str:
-    """Extract text from a PDF byte stream via Apache Tika."""
+async def _pdf_to_text(data: bytes, tika_url: str) -> str:
+    """Extract text from a PDF byte stream via Apache Tika without blocking
+    Open WebUI's async event loop."""
     try:
-        resp = httpx.put(
-            f"{tika_url.rstrip('/')}/tika",
-            content=data,
-            headers={"Content-Type": "application/pdf", "Accept": "text/plain"},
-            timeout=30.0,
-        )
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.put(
+                f"{tika_url.rstrip('/')}/tika",
+                content=data,
+                headers={
+                    "Content-Type": "application/pdf",
+                    "Accept": "text/plain",
+                },
+            )
         resp.raise_for_status()
         text = resp.text.strip()
         return text if text else "[PDF contained no extractable text]"
@@ -925,7 +930,7 @@ class Tools:
                     {"error": "PDF returned no content", "url": fetch_url, "status": status}
                 )
             await _emit_status(__event_emitter__, "Extracting PDF text...")
-            extracted = _pdf_to_text(body, v.TIKA_URL)
+            extracted = await _pdf_to_text(body, v.TIKA_URL)
             extracted = _trim(extracted, v.MAX_PAGE_CHARS)
             await self._maybe_emit_citation(
                 __event_emitter__, fetch_url, f"PDF: {fetch_url}", extracted
@@ -982,7 +987,12 @@ class Tools:
             try:
                 structured = _structured_from_html(text, fetch_url)
             except Exception as e:
-                return json.dumps({"error": f"Failed to parse HTML: {e}", "url": fetch_url})
+                await _emit_status(
+                    __event_emitter__, f"Failed to parse HTML: {e}", done=True
+                )
+                return json.dumps(
+                    {"error": f"Failed to parse HTML: {e}", "url": fetch_url}
+                )
             # Limit headings
             if structured.get("headings"):
                 structured["headings"] = structured["headings"][: v.MAX_ENRICH_HEADINGS]
@@ -1013,7 +1023,12 @@ class Tools:
         try:
             full_soup = BeautifulSoup(text, "lxml")
         except Exception as e:
-            return json.dumps({"error": f"Failed to parse HTML: {e}", "url": fetch_url})
+            await _emit_status(
+                __event_emitter__, f"Failed to parse HTML: {e}", done=True
+            )
+            return json.dumps(
+                {"error": f"Failed to parse HTML: {e}", "url": fetch_url}
+            )
 
         soup_title = _page_title(full_soup)
 
@@ -1082,7 +1097,12 @@ class Tools:
         try:
             plain = _plain_text_from_html(text)
         except Exception as e:
-            return json.dumps({"error": f"Failed to parse HTML: {e}", "url": fetch_url})
+            await _emit_status(
+                __event_emitter__, f"Failed to parse HTML: {e}", done=True
+            )
+            return json.dumps(
+                {"error": f"Failed to parse HTML: {e}", "url": fetch_url}
+            )
 
         if soup_title:
             plain = f"{soup_title}\n\n{plain}"
@@ -1194,11 +1214,16 @@ class Tools:
                         "metadata": [
                             {
                                 "date_accessed": datetime.utcnow().isoformat(),
-                                "source": title or url,
+                                "source": url,
+                                "name": title or url,
                                 "url": url,
                             }
                         ],
-                        "source": {"name": title or url, "url": url},
+                        "source": {
+                            "name": title or url,
+                            "id": url,
+                            "url": url,
+                        },
                     },
                 }
             )

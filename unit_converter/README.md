@@ -10,11 +10,19 @@ A lightweight unit conversion tool for [Open WebUI](https://github.com/open-webu
 - Offline tables for length/weight/temperature (no API required)
 - Currency via [exchangerate.host](https://exchangerate.host) (free tier)
 
+## Compatibility
+
+- Open WebUI **0.11.0 or later**
+- A model with native tool calling
+
 ## Installation
 
-1. In Open WebUI, go to **Workspace → Tools → +**.
-2. Paste the contents of `unit_converter.py`.
+1. In Open WebUI, go to **Workspace → Tools**.
+2. Open **Create**, create a tool, and paste the contents of `unit_converter.py`.
 3. Save. The `httpx` dependency listed in the frontmatter installs automatically on most setups (see the production note below if you run with multiple workers).
+4. Add the tool to a model under **Workspace → Models → Tools**, or enable it per-chat from the composer’s **Integrations** menu.
+
+Native function calling is the default in Open WebUI 0.11. If a model has an explicit override, use **Native**, not Legacy.
 
 ## Configuration
 

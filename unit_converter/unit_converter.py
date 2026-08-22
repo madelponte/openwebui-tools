@@ -5,8 +5,9 @@ description: >
     Examples: "convert 5 miles to km", "100 USD to EUR",
     "350 F to C", "2.5 kg to lbs".
 author: mdelponte
-version: 1.0.0
+version: 1.1.0
 license: MIT
+required_open_webui_version: 0.11.0
 requirements: httpx
 """
 
@@ -158,6 +159,7 @@ class Tools:
                 "Free access key from https://exchangerate.host (required for "
                 "currency conversions). Length/weight/temperature work without it."
             ),
+            json_schema_extra={"input": {"type": "password"}},
         )
 
     async def convert(
@@ -227,6 +229,31 @@ class Tools:
 
         return f"{_fmt(value)} {from_unit} = {_fmt(result)} {to_unit}"
 
+    @staticmethod
+    async def _emit_status(
+        emitter: Optional[Callable[[dict], Awaitable[None]]],
+        description: str,
+        *,
+        done: bool = False,
+        hidden: bool = False,
+    ) -> None:
+        if not emitter:
+            return
+        try:
+            await emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": description,
+                        "done": done,
+                        "hidden": hidden,
+                    },
+                }
+            )
+        except Exception:
+            # Event delivery is optional and must not break the conversion.
+            pass
+
     async def _convert_currency(
         self,
         amount: float,
@@ -234,14 +261,9 @@ class Tools:
         to_code: str,
         emitter: Optional[Callable[[dict], Awaitable[None]]],
     ) -> Optional[float]:
-        if emitter:
-            await emitter({
-                "type": "status",
-                "data": {
-                    "description": f"Fetching {from_code}→{to_code} rate…",
-                    "done": False,
-                },
-            })
+        await self._emit_status(
+            emitter, f"Fetching {from_code}→{to_code} rate…"
+        )
 
         url = "https://api.exchangerate.host/convert"
         params = {
@@ -256,30 +278,22 @@ class Tools:
                 r = await client.get(
                     url,
                     params=params,
-                    headers={"User-Agent": "OpenWebUI-UnitConverter/1.0"},
+                    headers={"User-Agent": "OpenWebUI-UnitConverter/1.1"},
                 )
                 r.raise_for_status()
                 data = r.json()
         except Exception as exc:
-            if emitter:
-                await emitter({
-                    "type": "status",
-                    "data": {"description": f"API error: {exc}", "done": True},
-                })
+            await self._emit_status(emitter, f"API error: {exc}", done=True)
             return None
 
         if not data.get("success", False) or "result" not in data:
             err_info = data.get("error", {}).get("info") or "unknown error"
-            if emitter:
-                await emitter({
-                    "type": "status",
-                    "data": {"description": f"API error: {err_info}", "done": True},
-                })
+            await self._emit_status(
+                emitter, f"API error: {err_info}", done=True
+            )
             return None
 
-        if emitter:
-            await emitter({
-                "type": "status",
-                "data": {"description": "Rate fetched ✓", "done": True, "hidden": True},
-            })
+        await self._emit_status(
+            emitter, "Rate fetched ✓", done=True, hidden=True
+        )
         return float(data["result"])

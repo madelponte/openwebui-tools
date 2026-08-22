@@ -1,12 +1,23 @@
 # Ask Clarifying Questions
 
-A simple tool that allows and encourages the model to ask the user clarifying questions if it doesn't understand the prompt well enough. When the model calls the tool, a prompt appears before the user with the question(s) that the model requested clarification on. The model will wait for the user to respond before continuing.
+A Workspace Tool that lets a model pause and ask the user for missing information. The user's answer is returned to the model so it can continue with fewer assumptions.
+
+## Compatibility
+
+- Open WebUI **0.11.0 or later**
+- A model with native function/tool calling support
+- A live WebUI chat session (interactive prompts are not available to ordinary API-only callers)
 
 ## Installation
 
-1. Go to **Workspace → Tools** and click the **+** button.
-2. Paste the contents of `smart_web_search.py` into the editor.
-3. Give it a name (e.g. "Smart Web Search") and save.
-4. Go to **Workspace → Models**, select your model, click the edit icon.
-5. Scroll to the **Tools** section and check "Smart Web Search".
-6. In your chat, open **Advanced Params** and set **Function Calling** to **Native**.
+1. Go to **Workspace → Tools**.
+2. Open **Create** and create a new tool.
+3. Paste the contents of `ask_clarifying_questions.py`, then save it.
+4. In **Workspace → Models**, edit the model that should use the tool.
+5. Add **Ask Clarifying Questions** in the model's **Tools** section and save.
+
+Native function calling is the default in Open WebUI 0.11.0. If the model has an explicit override, ensure **Function Calling** is set to **Native**, not Legacy.
+
+## Notes
+
+Open WebUI's `__event_call__` waits indefinitely by default. Administrators can configure `WEBSOCKET_EVENT_CALLER_TIMEOUT` to bound the wait. This tool handles both timeout exceptions and the disconnected-client response introduced in current Open WebUI versions.

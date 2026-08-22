@@ -2,11 +2,12 @@
 title: Ask Clarifying Questions
 description: Allows models to ask the user clarifying questions before proceeding. When enabled, the model can call this tool to pause and gather additional information from the user, reducing assumptions and improving response quality.
 author: mdelponte
-version: 1.0.1
+version: 1.1.0
 license: MIT
+required_open_webui_version: 0.11.0
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Awaitable, Callable, Any, Optional
 
 
@@ -63,16 +64,47 @@ class Tools:
                 }
             )
 
-        response = await __event_call__(
-            {
-                "type": "input",
-                "data": {
-                    "title": "Clarification Needed",
-                    "message": question,
-                    "placeholder": "Type your answer here...",
-                },
-            }
-        )
+        try:
+            response = await __event_call__(
+                {
+                    "type": "input",
+                    "data": {
+                        "title": "Clarification Needed",
+                        "message": question,
+                        "placeholder": "Type your answer here...",
+                    },
+                }
+            )
+        except Exception as exc:
+            # Open WebUI 0.11 can raise when WEBSOCKET_EVENT_CALLER_TIMEOUT
+            # expires. Always finish the status so the UI does not keep
+            # showing a loading shimmer.
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "Clarification request timed out.",
+                            "done": True,
+                        },
+                    }
+                )
+            return f"Error: Unable to get clarification from the user ({exc})."
+
+        # A disconnected browser is reported as an error object rather than an
+        # exception in Open WebUI 0.11.
+        if isinstance(response, dict) and response.get("error"):
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "Clarification request was interrupted.",
+                            "done": True,
+                        },
+                    }
+                )
+            return f"Error: {response['error']}"
 
         if __event_emitter__:
             await __event_emitter__(
@@ -85,13 +117,15 @@ class Tools:
                 }
             )
 
-        # Handle the response — __event_call__ returns the user's input
-        # which may be a string directly or a dict with a "value" key
+        # The browser normally returns the input directly. Keep support for the
+        # older {"value": ...} response shape as well.
         if isinstance(response, dict):
-            user_answer = response.get("value", str(response))
+            user_answer = response.get("value")
+            if user_answer is None:
+                user_answer = str(response)
         elif response is None or response == "":
             user_answer = "(No response provided)"
         else:
             user_answer = str(response)
 
-        return user_answer
+        return str(user_answer)

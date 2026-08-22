@@ -1,7 +1,7 @@
 """
 title: Deep Research
 author: mdelponte
-version: 2.5.0
+version: 2.6.0
 license: MIT
 description: >
     A deep research pipe that takes a user query, generates a research plan,
@@ -20,7 +20,7 @@ description: >
     extraction. Every fetch is SSRF-guarded (each URL and redirect hop must
     resolve to a public address), charset-decoded like a browser, and bounded by
     a download-size cap.
-required_open_webui_version: 0.9.0
+required_open_webui_version: 0.11.0
 """
 
 import asyncio
@@ -66,8 +66,13 @@ try:
 except Exception:  # pragma: no cover - import guard
     _UNICODE_DAMMIT = None  # type: ignore
 
+from open_webui.config import (
+    RAG_EMBEDDING_CONTENT_PREFIX,
+    RAG_EMBEDDING_QUERY_PREFIX,
+)
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.misc import pop_system_message, get_last_user_message
+from open_webui.models.config import Config
 from open_webui.models.users import Users
 
 # YouTube transcript support is optional: a research run may surface a YouTube
@@ -776,8 +781,8 @@ class Pipe:
             default="",
             description=(
                 "Model ID used for research planning, query generation, "
-                "snippet analysis, and final report writing. "
-                "Leave blank to use the default model."
+                "snippet analysis, and final report writing. This must be an "
+                "accessible Open WebUI model ID; it cannot be this pipe's ID."
             ),
         )
         EMBEDDING_MODEL: str = Field(
@@ -1033,7 +1038,12 @@ class Pipe:
         temperature: float = 0.3,
         max_tokens: int = 4096,
     ) -> str:
-        model = self.valves.RESEARCH_MODEL or "default"
+        model = (self.valves.RESEARCH_MODEL or "").strip()
+        if not model:
+            raise ValueError(
+                "RESEARCH_MODEL is not configured. Set it to an accessible "
+                "Open WebUI model ID in the Deep Research function valves."
+            )
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -1058,7 +1068,24 @@ class Pipe:
         stripped. Shared by ``_llm_call`` and the background-task branch of
         ``pipe`` so the streaming parse lives in one place.
         """
+        # Open WebUI normally returns a dict for non-streaming completions, but
+        # provider errors and some compatible backends return a JSONResponse.
+        if hasattr(response, "model_dump"):
+            response = response.model_dump()
+        if not isinstance(response, dict) and hasattr(response, "body"):
+            body = response.body
+            if isinstance(body, bytes):
+                body = body.decode("utf-8", errors="replace")
+            try:
+                response = json.loads(body)
+            except (TypeError, json.JSONDecodeError):
+                response = None
         if isinstance(response, dict):
+            if response.get("error"):
+                error = response["error"]
+                if isinstance(error, dict):
+                    error = error.get("message") or error.get("detail") or error
+                raise RuntimeError(f"Model request failed: {error}")
             return (
                 response.get("choices", [{}])[0]
                 .get("message", {})
@@ -1129,8 +1156,10 @@ class Pipe:
                 "type": "citation",
                 "data": {
                     "document": [snippet or ""],
-                    "metadata": [{"source": url}],
-                    "source": {"name": title or url, "url": url},
+                    "metadata": [
+                        {"source": url, "name": title or url, "url": url}
+                    ],
+                    "source": {"name": title or url, "id": url, "url": url},
                 },
             }
         )
@@ -2327,14 +2356,36 @@ Guidelines:
         if not segs or not (query or "").strip():
             return None
 
-        vectors = await self._embed([query] + segs, request, user)
-        if not vectors or len(vectors) != len(segs) + 1:
+        # Prefix-aware models use different instructions for queries and stored
+        # content. Open WebUI 0.11 consistently applies these prefixes, so embed
+        # the query and page segments separately rather than mixing both roles in
+        # one batch with prefix=None.
+        query_vectors, segment_vectors = await asyncio.gather(
+            self._embed(
+                [query],
+                request,
+                user,
+                prefix=RAG_EMBEDDING_QUERY_PREFIX,
+            ),
+            self._embed(
+                segs,
+                request,
+                user,
+                prefix=RAG_EMBEDDING_CONTENT_PREFIX,
+            ),
+        )
+        if (
+            not query_vectors
+            or len(query_vectors) != 1
+            or not segment_vectors
+            or len(segment_vectors) != len(segs)
+        ):
             return None
 
-        qv = vectors[0]
+        qv = query_vectors[0]
         scored = [
             (_cosine(qv, sv), i, seg)
-            for i, (sv, seg) in enumerate(zip(vectors[1:], segs))
+            for i, (sv, seg) in enumerate(zip(segment_vectors, segs))
         ]
         # Best segments by similarity, then restore document order for readability.
         scored.sort(key=lambda t: t[0], reverse=True)
@@ -2356,7 +2407,12 @@ Guidelines:
         return passages, score
 
     async def _embed(
-        self, texts: List[str], request: Any, user: Any
+        self,
+        texts: List[str],
+        request: Any,
+        user: Any,
+        *,
+        prefix: Optional[str] = None,
     ) -> Optional[List[List[float]]]:
         """Embed `texts` via Open WebUI's configured embeddings endpoint.
 
@@ -2370,39 +2426,49 @@ Guidelines:
         if not self.valves.EMBEDDING_MODEL or request is None or not texts:
             return None
         try:
-            cfg = request.app.state.config
-            engine = (getattr(cfg, "RAG_EMBEDDING_ENGINE", "") or "").lower()
+            # Open WebUI 0.11 replaced request.app.state.config with the async,
+            # per-key Config model. Read the current RAG connection settings in
+            # one query, matching Open WebUI's own embedding setup.
+            cfg = await Config.get_many(
+                "rag.embedding_engine",
+                "rag.openai.api_base_url",
+                "rag.openai.api_key",
+                "rag.ollama.base_url",
+                "rag.ollama.api_key",
+                "rag.azure_openai.base_url",
+                "rag.azure_openai.api_key",
+                "rag.azure_openai.api_version",
+            )
+            engine = (cfg.get("rag.embedding_engine") or "").lower()
             if engine in ("openai", "ollama", "azure_openai"):
                 from open_webui.retrieval.utils import generate_embeddings
 
                 if engine == "openai":
-                    url = getattr(cfg, "RAG_OPENAI_API_BASE_URL", "")
-                    key = getattr(cfg, "RAG_OPENAI_API_KEY", "")
+                    url = cfg.get("rag.openai.api_base_url") or ""
+                    key = cfg.get("rag.openai.api_key") or ""
                 elif engine == "ollama":
-                    url = getattr(cfg, "RAG_OLLAMA_BASE_URL", "")
-                    key = getattr(cfg, "RAG_OLLAMA_API_KEY", "")
+                    url = cfg.get("rag.ollama.base_url") or ""
+                    key = cfg.get("rag.ollama.api_key") or ""
                 else:
-                    url = getattr(cfg, "RAG_AZURE_OPENAI_BASE_URL", "")
-                    key = getattr(cfg, "RAG_AZURE_OPENAI_API_KEY", "")
+                    url = cfg.get("rag.azure_openai.base_url") or ""
+                    key = cfg.get("rag.azure_openai.api_key") or ""
                 vectors = await generate_embeddings(
                     engine=engine,
                     model=self.valves.EMBEDDING_MODEL,
                     text=texts,
-                    prefix=None,
+                    prefix=prefix,
                     url=url,
                     key=key,
                     user=user,
-                    azure_api_version=getattr(
-                        cfg, "RAG_AZURE_OPENAI_API_VERSION", None
-                    ),
+                    azure_api_version=cfg.get("rag.azure_openai.api_version"),
                 )
             else:
-                # Local engine (or unknown): use the embedding function Open WebUI
-                # already built from its RAG configuration.
+                # The local engine uses Open WebUI's configured local embedding
+                # model; EMBEDDING_MODEL acts as the opt-in switch in this case.
                 ef = getattr(request.app.state, "EMBEDDING_FUNCTION", None)
                 if ef is None:
                     return self._embed_fallback(None)
-                vectors = await ef(texts, user=user)
+                vectors = await ef(texts, prefix=prefix, user=user)
 
             if (
                 isinstance(vectors, list)
@@ -3014,9 +3080,8 @@ You may reference the existing [n] citation numbers that appear in the sections.
         """
         Orchestrate the deep-research workflow.
 
-        Returns an empty string because the final report is written
-        directly into the message via ``_emit_replace``.  This prevents
-        Open WebUI from appending a duplicate or re-invoking the pipe.
+        Returns the final report directly, as required by Open WebUI's pipe
+        response lifecycle. Replace events are used only for live progress.
         """
         # ==============================================================
         # TASK GUARD: Open WebUI re-invokes the pipe for background
@@ -3027,8 +3092,13 @@ You may reference the existing [n] citation numbers that appear in the sections.
         # ==============================================================
         if __task__:
             log.info(f"Task call received: {__task__} — forwarding to model")
-            task_model = self.valves.RESEARCH_MODEL or "default"
+            task_model = (self.valves.RESEARCH_MODEL or "").strip()
             task_messages = body.get("messages", [])
+            if not task_model or task_model == body.get("model"):
+                # A pipe has no implicit "default" model ID in Open WebUI 0.11.
+                # Returning a stable label is preferable to recursively invoking
+                # this pipe or making a request for a nonexistent model.
+                return "Deep Research"
             try:
                 user_obj = None
                 if __user__:
@@ -3050,6 +3120,18 @@ You may reference the existing [n] citation numbers that appear in the sections.
 
         log.info("Deep Research pipe invoked — main research flow")
 
+        research_model = (self.valves.RESEARCH_MODEL or "").strip()
+        if not research_model:
+            return (
+                "Deep Research is not configured: set the RESEARCH_MODEL valve "
+                "to an accessible Open WebUI model ID."
+            )
+        if research_model == body.get("model"):
+            return (
+                "Deep Research is misconfigured: RESEARCH_MODEL cannot be the "
+                "Deep Research pipe itself."
+            )
+
         # ==============================================================
         # RE-ENTRY GUARD: if the conversation already has a completed
         # report, don't run again.
@@ -3062,9 +3144,13 @@ You may reference the existing [n] citation numbers that appear in the sections.
                     log.info("Re-entry guard: report exists, skipping")
                     return ""
 
-        # Extract user query
-        _, messages = pop_system_message(all_messages)
-        user_query = get_last_user_message(messages)
+        # Open WebUI 0.11 preserves the user's original prompt in metadata.
+        # Prefer it because body.messages may contain a citation/RAG wrapper
+        # when files or knowledge sources are attached.
+        user_query = str((__metadata__ or {}).get("user_prompt") or "").strip()
+        if not user_query:
+            _, messages = pop_system_message(all_messages)
+            user_query = get_last_user_message(messages)
         if not user_query:
             return "Please provide a research topic or question."
 
@@ -3095,24 +3181,41 @@ You may reference the existing [n] citation numbers that appear in the sections.
                         __event_emitter__,
                         "⏳ Waiting for plan confirmation…",
                     )
-                    confirmation = await __event_call__(
-                        {
-                            "type": "input",
-                            "data": {
-                                "title": "📋 Research Plan Review",
-                                "message": (
-                                    f"{plan_text}\n\n"
-                                    "Type **ok** or **yes** to proceed, "
-                                    "or describe changes you'd like."
-                                ),
-                                "placeholder": ("ok / yes / your modifications…"),
-                            },
-                        }
-                    )
+                    try:
+                        confirmation = await __event_call__(
+                            {
+                                "type": "input",
+                                "data": {
+                                    "title": "📋 Research Plan Review",
+                                    "message": (
+                                        f"{plan_text}\n\n"
+                                        "Type **ok** or **yes** to proceed, "
+                                        "or describe changes you'd like."
+                                    ),
+                                    "placeholder": (
+                                        "ok / yes / your modifications…"
+                                    ),
+                                },
+                            }
+                        )
+                    except Exception as exc:
+                        # WEBSOCKET_EVENT_CALLER_TIMEOUT raises in Open WebUI
+                        # 0.11. Continue with the generated plan rather than
+                        # discarding an otherwise valid research run.
+                        log.warning("Plan confirmation unavailable: %s", exc)
+                        confirmation = None
 
                     resp = ""
                     if isinstance(confirmation, dict):
-                        resp = str(confirmation.get("value", "")).strip().lower()
+                        if confirmation.get("error"):
+                            log.warning(
+                                "Plan confirmation interrupted: %s",
+                                confirmation["error"],
+                            )
+                        else:
+                            resp = str(
+                                confirmation.get("value", "")
+                            ).strip().lower()
                     elif isinstance(confirmation, str):
                         resp = confirmation.strip().lower()
 
