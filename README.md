@@ -5,7 +5,7 @@ Workspace Tools and a Deep Research Pipe for [Open WebUI](https://github.com/ope
 The maintained in-process plugins in this repository target **Open WebUI 0.11.0 or later**:
 
 - `agentic_web_search/` — SearXNG search and resilient page fetching
-- `ask_clarifying_questions/` — interactive clarification prompts
+- `ask_clarifying_questions/` — open-ended and multiple-choice clarification, inline on 0.11.1+ with a floating-dialog fallback
 - `calculator/` — safe arithmetic with an optional Rich UI result card
 - `deep_research_pipe/` — multi-cycle, citation-grounded research reports
 - `stock_data/` — stock quotes, profiles, financials, earnings, news, and recommendations
