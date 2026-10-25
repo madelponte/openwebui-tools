@@ -4,8 +4,9 @@ description: >
     Run computations and look up factual data via the Wolfram Alpha LLM API.
     Handles math, unit conversions, science, geography, finance, dates, and more.
 author: mdelponte
-version: 1.0.0
+version: 1.1.0
 license: MIT
+required_open_webui_version: 0.11.0
 requirements: httpx
 """
 
@@ -27,12 +28,20 @@ async def _emit(
 ) -> None:
     if emitter is None:
         return
-    await emitter(
-        {
-            "type": "status",
-            "data": {"description": description, "done": done, "hidden": False},
-        }
-    )
+    try:
+        await emitter(
+            {
+                "type": "status",
+                "data": {
+                    "description": description,
+                    "done": done,
+                    "hidden": False,
+                },
+            }
+        )
+    except Exception:
+        # Event delivery is optional and must not hide the Wolfram result.
+        pass
 
 
 def _parse_sections(text: str) -> list:
@@ -295,6 +304,7 @@ class Tools:
         app_id: str = Field(
             "",
             description="Your Wolfram Alpha AppID. Get one free at https://developer.wolframalpha.com",
+            json_schema_extra={"input": {"type": "password"}},
         )
         default_units: str = Field(
             "metric",
@@ -377,7 +387,7 @@ class Tools:
                 response = await client.get(
                     BASE_URL,
                     params=params,
-                    headers={"User-Agent": "OpenWebUI-WolframAlpha/1.0"},
+                    headers={"User-Agent": "OpenWebUI-WolframAlpha/1.1"},
                 )
         except httpx.TimeoutException:
             msg = "❌ Wolfram Alpha request timed out after 30s."
@@ -408,7 +418,7 @@ class Tools:
                 suggestions=body.strip() if body.strip() else None,
             )
             return (
-                HTMLResponse(content=error_card, headers={"content-disposition": "inline"}),
+                HTMLResponse(content=error_card, headers={"Content-Disposition": "inline"}),
                 text_for_llm,
             )
 
@@ -444,6 +454,6 @@ class Tools:
         card_html = _build_card(clean_query, body)
         # Return both: the rendered card AND the raw text for the LLM to read.
         return (
-            HTMLResponse(content=card_html, headers={"content-disposition": "inline"}),
+            HTMLResponse(content=card_html, headers={"Content-Disposition": "inline"}),
             body,
         )

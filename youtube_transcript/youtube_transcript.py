@@ -9,9 +9,10 @@ description: >
     Example commands: "summarize this video: https://youtu.be/dQw4w9WgXcQ",
     "what does this video say about X: <url>", "transcript of <url>".
 author: mdelponte
-version: 1.0.1
+version: 1.1.0
 license: MIT
-requirements: youtube-transcript-api
+required_open_webui_version: 0.11.0
+requirements: youtube-transcript-api>=1.0.0
 """
 
 import anyio
@@ -114,12 +115,20 @@ async def _emit(
 ) -> None:
     if emitter is None:
         return
-    await emitter(
-        {
-            "type": "status",
-            "data": {"description": description, "done": done, "hidden": False},
-        }
-    )
+    try:
+        await emitter(
+            {
+                "type": "status",
+                "data": {
+                    "description": description,
+                    "done": done,
+                    "hidden": False,
+                },
+            }
+        )
+    except Exception:
+        # Event delivery is optional and must not hide transcript results.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +176,7 @@ class Tools:
         webshare_proxy_password: str = Field(
             "",
             description="Optional. Webshare Residential proxy password. See username field.",
+            json_schema_extra={"input": {"type": "password"}},
         )
         http_proxy_url: str = Field(
             "",
@@ -175,6 +185,7 @@ class Tools:
                 "(e.g. 'http://user:pass@host:port' or 'socks5://127.0.0.1:9050'). "
                 "Used only if the Webshare fields above are empty. Leave blank for no proxy."
             ),
+            json_schema_extra={"input": {"type": "password"}},
         )
 
     # -------------------------------------------------------------------

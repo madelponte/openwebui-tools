@@ -2,8 +2,8 @@
 title: Stock Data
 author: mdelponte
 author_url: https://github.com/mdelponte
-version: 1.0.1
-required_open_webui_version: 0.5.0
+version: 1.1.0
+required_open_webui_version: 0.11.0
 license: MIT
 description: Query stock market data — quotes, fundamentals, financials, earnings, and news. Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally Financial Modeling Prep for deep financial statements.
 requirements: requests, yfinance
@@ -146,7 +146,10 @@ class Tools:
         )
         include_raw_numbers: bool = Field(
             default=False,
-            description="Include raw numeric values alongside human-readable formatting (e.g. market cap in both '3.45T' and 3450000000000).",
+            description=(
+                "Reserved for a future output-format option. Current responses "
+                "include the provider's numeric values for model accuracy."
+            ),
         )
 
     def __init__(self):
@@ -183,7 +186,7 @@ class Tools:
             url,
             params=params,
             timeout=self.valves.request_timeout,
-            headers={"User-Agent": "OpenWebUI-StockDataTool/1.0"},
+            headers={"User-Agent": "OpenWebUI-StockDataTool/1.1"},
         )
         resp.raise_for_status()
         data = resp.json()

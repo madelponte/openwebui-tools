@@ -17,13 +17,20 @@ Covers:
 - **Finance** — stock data, historical prices
 - **Nutrition, weather history, linguistics**, and structured comparisons of named entities
 
+## Compatibility
+
+- Open WebUI **0.11.0 or later**
+- A model with native tool calling
+
 ## Installation
 
 1. Get a free AppID at [developer.wolframalpha.com](https://developer.wolframalpha.com).
-2. In OpenWebUI, go to **Workspace → Tools → Create New Tool** (or import).
-3. Paste in the contents of `wolfram_alpha.py`.
+2. In Open WebUI, go to **Workspace → Tools** and open **Create**.
+3. Create a tool and paste in the contents of `wolfram-alpha.py`.
 4. Save, then open the tool's valve settings and paste your AppID into `app_id`.
-5. Enable the tool in any chat that uses a model with native tool-calling.
+5. Add it to a model under **Workspace → Models → Tools**, or enable it per-chat from the composer’s **Integrations** menu.
+
+Native function calling is the default in Open WebUI 0.11. If a model has an explicit override, use **Native**, not Legacy.
 
 ## Valves
 
@@ -36,7 +43,7 @@ Covers:
 
 ## Returns
 
-- **Success (with `render_card=True`):** an HTML card rendered inline in chat, plus the raw Wolfram response sent to the LLM so it can reason about the result.
+- **Success (with `render_card=True`):** an Open WebUI 0.11 Rich UI embed rendered inline in chat, plus the raw Wolfram response sent to the LLM through tuple result context.
 - **Success (with `render_card=False`):** the raw Wolfram response as plain text.
 - **Uninterpretable query (HTTP 501):** the model receives Wolfram's suggested rephrasings so it can retry intelligently.
 - **Config or network errors:** plain-string error messages.
@@ -56,7 +63,7 @@ These constraints come directly from Wolfram's [recommended prompt](https://prod
 
 ## Requirements
 
-- Python 3.10+ (compatible with OpenWebUI's 3.10/3.11 runtime)
+- The Python runtime bundled with Open WebUI 0.11
 - `httpx` (installed automatically via tool frontmatter, or pre-install in production)
 
 ## License

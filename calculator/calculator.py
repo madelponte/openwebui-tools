@@ -12,8 +12,9 @@ description: >
       - "Compute sin(pi / 4)"
       - "What is 5 factorial?"
 author: mdelponte
-version: 1.0.0
+version: 1.1.0
 license: MIT
+required_open_webui_version: 0.11.0
 """
 
 import ast
@@ -191,12 +192,20 @@ def _format_result(value) -> str:
 async def _emit(emitter, description: str, done: bool = False, hidden: bool = False):
     if emitter is None:
         return
-    await emitter(
-        {
-            "type": "status",
-            "data": {"description": description, "done": done, "hidden": hidden},
-        }
-    )
+    try:
+        await emitter(
+            {
+                "type": "status",
+                "data": {
+                    "description": description,
+                    "done": done,
+                    "hidden": hidden,
+                },
+            }
+        )
+    except Exception:
+        # UI event delivery should never make the calculation itself fail.
+        pass
 
 
 # --- HTML card -------------------------------------------------------------
@@ -298,7 +307,7 @@ class Tools:
         self,
         expression: str,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
-    ) -> "HTMLResponse | str":
+    ) -> "tuple[HTMLResponse, dict] | str":
         """
         Evaluate a mathematical expression and return the numeric result rendered
         as an inline card.
@@ -360,4 +369,16 @@ class Tools:
             hidden=True,
         )
 
-        return HTMLResponse(content=card, headers={"content-disposition": "inline"})
+        # Open WebUI 0.11 supports (HTMLResponse, context) tuples. The card is
+        # rendered for the user while the structured result is returned to the
+        # model, instead of the generic "embedded UI is visible" fallback.
+        return (
+            HTMLResponse(
+                content=card,
+                headers={"Content-Disposition": "inline"},
+            ),
+            {
+                "expression": display_expr,
+                "result": result_display,
+            },
+        )
