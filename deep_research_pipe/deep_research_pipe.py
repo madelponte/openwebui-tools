@@ -1,44 +1,34 @@
 """
 title: Deep Research
 author: mdelponte
-version: 2.6.0
+version: 3.0.0
 license: MIT
 description: >
     A deep research pipe that takes a user query, generates a research plan,
     presents it for confirmation, then runs a section-attributed, gap-driven
-    research loop and writes a structured, citation-grounded report. Fetched
-    pages are relevance-extracted (the passages matching each query, not the
-    page head), de-duplicated, and the loop follows promising in-page links
-    (multi-hop) and biases toward recent sources when the topic is time-
-    sensitive. The report is written section by section against each section's
-    own sources under one global citation index. Fetching mirrors the companion
-    fetch_page MCP tool's resilient ladder: Apache Tika for PDF/Office/
-    OpenDocument/RTF/EPUB documents (detected by content-type, extension, or a
-    magic-byte sniff so mislabelled binaries aren't decoded as garbage), bot-wall/
-    CAPTCHA/429 detection that re-renders through FlareSolverr, a Wayback Machine
-    fallback for pages that stay blocked or render empty, and YouTube transcript
-    extraction. Every fetch is SSRF-guarded (each URL and redirect hop must
-    resolve to a public address), charset-decoded like a browser, and bounded by
-    a download-size cap.
-required_open_webui_version: 0.11.0
+    research loop and writes a structured, citation-grounded report. Searching
+    and page reading are delegated to the companion MCP server's `search_web`
+    (Brave LLM Context: relevance-ranked excerpts plus source metadata) and
+    `fetch_page` (browser-first acquisition, quality gate, Firecrawl fallback,
+    Tika documents, Reddit, and YouTube transcripts) tools, attached to Open
+    WebUI as an MCP tool server. Fetched pages are relevance-extracted (the
+    passages matching each query, not the page head), de-duplicated, and the
+    loop follows promising in-page links (multi-hop) and biases toward recent
+    sources when the topic is time-sensitive. A page that can't be read still
+    contributes its search excerpts. The report is written section by section
+    against each section's own sources under one global citation index.
+required_open_webui_version: 0.12.4
 """
 
 import asyncio
-import codecs
-import ipaddress
 import json
 import logging
 import math
 import re
-import socket
-import time
 from datetime import datetime, timezone
-from functools import lru_cache
 from urllib.parse import (
     urlparse,
     urlunparse,
-    urljoin,
-    parse_qs,
     parse_qsl,
     urlencode,
 )
@@ -52,19 +42,7 @@ from typing import (
     Tuple,
 )
 
-import aiohttp
 from pydantic import BaseModel, Field
-
-# Charset detection mirrors the fetch_page MCP tool: BeautifulSoup's
-# UnicodeDammit gives statistical encoding detection for pages that declare no
-# charset. It ships with Open WebUI, but the pipe treats it as optional — if it's
-# missing we fall back to the declared charset / UTF-8 path in `_decode_body`.
-try:
-    from bs4 import UnicodeDammit
-
-    _UNICODE_DAMMIT = UnicodeDammit
-except Exception:  # pragma: no cover - import guard
-    _UNICODE_DAMMIT = None  # type: ignore
 
 from open_webui.config import (
     RAG_EMBEDDING_CONTENT_PREFIX,
@@ -74,19 +52,6 @@ from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.misc import pop_system_message, get_last_user_message
 from open_webui.models.config import Config
 from open_webui.models.users import Users
-
-# YouTube transcript support is optional: a research run may surface a YouTube
-# video URL whose real content is the spoken transcript, not the scrapeable
-# watch page. If the open-source `youtube-transcript-api` library (>= 1.0) is
-# installed in the Open WebUI environment we use it; if not, the pipe logs once
-# and falls back to a normal HTML fetch, so this stays a zero-config optional.
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-
-    _YT_AVAILABLE = True
-except Exception:  # pragma: no cover - import guard
-    YouTubeTranscriptApi = None  # type: ignore
-    _YT_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -110,99 +75,287 @@ def _setup_logger() -> logging.Logger:
 log = _setup_logger()
 
 # Marker we embed in the message body so we can detect that this
-# conversation already contains a completed research report.  If the
-# pipe is re-invoked (Open WebUI can do this after the first response
-# is appended to the chat) we check for this marker in the existing
-# assistant messages and bail out immediately rather than starting a
-# second research run.
+# conversation already contains a completed research report. A later message
+# in the same chat is then answered as a follow-up question about the report
+# instead of starting a second research run.
 _DONE_MARKER = "\n\n---DEEP-RESEARCH-COMPLETE---"
 
 
 # ---------------------------------------------------------------------------
-# Fetch infrastructure constants (ported from the fetch_page MCP tool)
+# MCP tool layer
+#
+# The pipe no longer fetches anything itself. It calls two tools on the
+# companion MCP server, which owns search (Brave LLM Context) and the whole
+# page-acquisition ladder (SSRF guard, FlareSolverr, quality gate, Firecrawl,
+# Tika, Reddit, YouTube transcripts). Open WebUI hands a pipe every tool
+# resolved for the chat in `__tools__`, keyed "<server id>_<tool name>"; when
+# the server isn't attached to the chat the pipe connects to it directly
+# through Open WebUI's own MCP connection settings.
 # ---------------------------------------------------------------------------
 
-# Bot-wall / CAPTCHA detection. A challenge page is what should route a fetch to
-# FlareSolverr (a real browser) instead of being returned as if it were content.
-# Cloudflare is the common case but not the only one: PerimeterX/HUMAN, DataDome,
-# and Akamai Bot Manager all serve a 403 (sometimes a 200) whose body is a
-# JS/CAPTCHA challenge with none of the Cloudflare markers, so they're matched
-# explicitly or the fallback never fires.
-# 401 is included because DataDome (e.g. Reuters) answers its interstitial with
-# HTTP 401; a plain 401 with no challenge marker still falls through as not-blocked
-# because `_is_blocked_response`'s marker check must also pass.
-BLOCK_STATUS_CODES = {401, 403, 503, 520, 521, 522, 523, 524, 525, 526, 527}
-CLOUDFLARE_MARKERS = (
-    "cf-ray",
-    "cf-chl",
-    "just a moment",
-    "attention required",
-    "cf-browser-verification",
-    "cf_chl_opt",
-    "challenge-platform",
-    "please enable cookies",
-    "/cdn-cgi/challenge-platform",
-    # Cloudflare's managed-challenge interstitial doesn't always carry a "just a
-    # moment" title or a cf-* token in a stripped response — but its visible body
-    # text is this. The >=2-marker rule still guards the bare-200 case.
-    "enable javascript and cookies to continue",
-)
-CHALLENGE_MARKERS = (
-    "px-cloud.net",
-    "/captcha/captcha.js",
-    "px-captcha",
-    "perimeterx",
-    "_pxhd",
-    "datadome",
-    "geo.captcha-delivery.com",
-    "ak_bmsc",
-    "/_sec/cp_challenge",
-    "access to this page has been denied",
-    "confirm you are a human",
-    "and not a bot",
-)
-ALL_BLOCK_MARKERS = CLOUDFLARE_MARKERS + CHALLENGE_MARKERS
+SEARCH_TOOL = "search_web"
+FETCH_TOOL = "fetch_page"
+_REQUIRED_TOOLS = (SEARCH_TOOL, FETCH_TOOL)
 
-# Document types Apache Tika can extract that are NOT served as text/html. Tika
-# auto-detects the format from the bytes, so any of these is routed to it rather
-# than treated as HTML.
-TIKA_DOCUMENT_CTYPES = (
-    "application/pdf",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument",  # docx/xlsx/pptx (prefix)
-    "application/vnd.ms-excel",
-    "application/vnd.ms-powerpoint",
-    "application/vnd.oasis.opendocument",  # odt/ods/odp (prefix)
-    "application/rtf",
-    "text/rtf",
-    "application/epub+zip",
+# search_web rejects queries over 600 characters or 75 words; LLM-written
+# queries are trimmed to fit rather than failing the call.
+_SEARCH_QUERY_MAX_CHARS = 600
+_SEARCH_QUERY_MAX_WORDS = 75
+
+# fetch_page formats whose content is markdown (links, heading anchors).
+_MARKDOWN_FORMATS = ("markdown", "section")
+
+
+class ToolCallError(RuntimeError):
+    """An MCP tool call failed: a tool error (isError), a transport failure, a
+    timeout, or a result without a JSON object payload."""
+
+
+def _parse_tool_result(result: Any) -> Dict[str, Any]:
+    """Return the JSON object payload of an Open WebUI MCP tool result.
+
+    Open WebUI's ``MCPClient.call_tool`` returns the MCP content list
+    (``[{"type": "text", "text": "<json>"}, ...]``) and raises on ``isError``.
+    This server's text block is the JSON payload (identical to its
+    structuredContent), so the first text block that parses to an object wins.
+    """
+    if isinstance(result, dict) and "type" not in result:
+        return result
+    items = result if isinstance(result, list) else [result]
+    for item in items:
+        text = item.get("text") if isinstance(item, dict) else item
+        if not isinstance(text, str):
+            continue
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return data
+    raise ToolCallError("tool returned no JSON object payload")
+
+
+def _tools_from_registry(
+    registry: Any, server_id: str = ""
+) -> Optional[Tuple[str, Dict[str, Callable[..., Any]]]]:
+    """Find search_web + fetch_page callables in Open WebUI's ``__tools__``.
+
+    MCP entries are keyed ``"<server id>_<tool name>"`` with ``type == "mcp"``
+    and an async ``callable(**kwargs)``. Returns ``(server_id, {tool: callable})``
+    for a server that exposes both tools (restricted to `server_id` when given),
+    or ``None``.
+    """
+    servers: Dict[str, Dict[str, Callable[..., Any]]] = {}
+    for key, entry in (registry or {}).items():
+        if not isinstance(entry, dict) or entry.get("type") != "mcp":
+            continue
+        fn = entry.get("callable")
+        if not callable(fn):
+            continue
+        for tool in _REQUIRED_TOOLS:
+            suffix = f"_{tool}"
+            if isinstance(key, str) and key.endswith(suffix) and len(key) > len(suffix):
+                servers.setdefault(key[: -len(suffix)], {})[tool] = fn
+    candidates = sorted(
+        sid
+        for sid, fns in servers.items()
+        if all(t in fns for t in _REQUIRED_TOOLS) and (not server_id or sid == server_id)
+    )
+    if not candidates:
+        return None
+    return candidates[0], servers[candidates[0]]
+
+
+class ResearchTools:
+    """One research run's handle on the MCP server's search_web / fetch_page.
+
+    `invoke(tool_name, args)` performs the raw call — either a ``__tools__``
+    callable or a pipe-owned ``MCPClient`` — and this class adds the per-call
+    timeout, result parsing, and mapping onto the shapes the research loop
+    consumes. Instances are per run, so `last_error` never leaks between
+    concurrent chats.
+    """
+
+    def __init__(
+        self,
+        server_id: str,
+        invoke: Callable[[str, Dict[str, Any]], Awaitable[Any]],
+        *,
+        timeout: float,
+        num_results: int,
+        default_time_range: str,
+    ):
+        self.server_id = server_id
+        self._invoke = invoke
+        self._timeout = timeout
+        self._num_results = num_results
+        self._default_time_range = default_time_range
+        self.last_error = ""
+
+    async def call(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Call `tool` and return its JSON payload, or raise ``ToolCallError``.
+
+        Uses ``asyncio.timeout`` rather than ``wait_for`` so the call stays in
+        the caller's task (Open WebUI's MCP client must not be torn down from a
+        foreign task). Task cancellation is never swallowed.
+        """
+        try:
+            if self._timeout > 0:
+                async with asyncio.timeout(self._timeout):
+                    raw = await self._invoke(tool, args)
+            else:
+                raw = await self._invoke(tool, args)
+            return _parse_tool_result(raw)
+        except ToolCallError:
+            raise
+        except TimeoutError as e:
+            raise ToolCallError(f"{tool} timed out after {self._timeout:g}s") from e
+        except Exception as e:
+            raise ToolCallError(str(e) or type(e).__name__) from e
+
+    async def search(self, query: str, time_range: str = "") -> List[Dict[str, Any]]:
+        """Run search_web and map its results to ``{title, url, snippet,
+        published_date}``. ``snippet`` is Brave's query-relevant excerpts joined
+        one per line. Returns ``[]`` on failure (recorded in `last_error`)."""
+        q = " ".join((query or "").split()[:_SEARCH_QUERY_MAX_WORDS])[
+            :_SEARCH_QUERY_MAX_CHARS
+        ].strip()
+        if not q:
+            return []
+        args: Dict[str, Any] = {"query": q}
+        if self._num_results > 0:
+            args["num_results"] = self._num_results
+        tr = (time_range or self._default_time_range or "").strip()
+        if tr:
+            args["time_range"] = tr
+        try:
+            payload = await self.call(SEARCH_TOOL, args)
+        except ToolCallError as e:
+            self.last_error = f"{SEARCH_TOOL}: {e}"
+            log.warning("search_web failed for %r: %s", q, e)
+            return []
+        out: List[Dict[str, Any]] = []
+        for r in payload.get("results") or []:
+            if not isinstance(r, dict) or not r.get("url"):
+                continue
+            snippets = [
+                s.strip()
+                for s in (r.get("snippets") or [])
+                if isinstance(s, str) and s.strip()
+            ]
+            out.append(
+                {
+                    "title": r.get("title") or r.get("site_name") or "",
+                    "url": r["url"],
+                    "snippet": "\n".join(snippets) or (r.get("description") or ""),
+                    "published_date": r.get("page_date"),
+                }
+            )
+        return out
+
+    async def fetch(self, url: str) -> Dict[str, Any]:
+        """Read `url` with fetch_page (default text mode).
+
+        Returns a page dict ``{url, title, text, links, kind}``: ``text`` is the
+        readable content (markdown flattened to plain lines; relevance extraction
+        happens later), ``links`` are the page's ``(anchor, url)`` links for
+        multi-hop, and ``kind`` is fetch_page's ``format`` (or ``"failed"``, with
+        empty text, when the tool raised).
+        """
+        try:
+            payload = await self.call(FETCH_TOOL, {"url": url})
+        except ToolCallError as e:
+            log.debug("fetch_page failed for %s: %s", url, e)
+            return {"url": url, "title": "", "text": "", "links": [], "kind": "failed"}
+        content = payload.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False) if content else ""
+        fmt = str(payload.get("format") or "")
+        is_md = fmt in _MARKDOWN_FORMATS
+        return {
+            "url": payload.get("url") or url,
+            "title": payload.get("title") or "",
+            "text": _markdown_to_text(content) if is_md else content,
+            "links": _markdown_links(content) if is_md else [],
+            "kind": fmt or "text",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Markdown helpers for fetch_page content
+#
+# fetch_page returns markdown: links are absolute ``[anchor](url)`` (in-page
+# citation markers already rewritten to their source URLs), headings carry
+# ``{#anchor}`` citation markers. Links feed multi-hop following; the scoring
+# text drops the markup so URLs and anchors don't dilute relevance.
+# ---------------------------------------------------------------------------
+
+# A markdown link or image. The anchor allows one level of nested brackets so
+# citation markers rendered as "[[12]](url)" match; the URL allows one level of
+# balanced parentheses so Wikipedia-style "Foo_(bar)" targets aren't cut short;
+# an optional "title" is tolerated.
+_MD_LINK_RE = re.compile(
+    r"(!?)\[((?:[^\[\]\n]|\[[^\[\]\n]*\]){0,300})\]"
+    r'\(((?:https?://)(?:[^\s()]|\([^\s()]*\))+)(?:\s+"[^"\n]*")?\)'
 )
-TIKA_DOCUMENT_EXTENSIONS = (
-    ".pdf",
-    ".doc",
-    ".docx",
-    ".xls",
-    ".xlsx",
-    ".ppt",
-    ".pptx",
-    ".odt",
-    ".ods",
-    ".odp",
-    ".rtf",
-    ".epub",
+# An anchor that is only a citation marker ("[12]", "12", "[a]", "note 3").
+_CITATION_ANCHOR_RE = re.compile(
+    r"^(?:\[(?:\d{1,4}|[a-z])\]|\d{1,4}|note\s*\d{1,4})$", re.I
 )
+# fetch_page's image placeholder, which links to the image's file page.
+_IMAGE_MARKER_PREFIX = "[Image at this location"
+# How much text before a citation marker stands in for its anchor text.
+_CITATION_CONTEXT_CHARS = 200
+_MD_HEADING_ANCHOR_RE = re.compile(r"[ \t]*\{#[^{}\s]+\}")
+_MD_LINE_PREFIX_RE = re.compile(r"^[ \t]{0,3}(?:#{1,6}|>+|[-*+]|\d+[.)])[ \t]+", re.M)
+_MD_RULE_RE = re.compile(r"^[ \t]*(?:[-*_=][ \t]*){3,}$", re.M)
 
-# Wayback Machine availability endpoint (no API key / local service needed).
-WAYBACK_AVAILABILITY_API = "https://archive.org/wayback/available"
 
-# A run of two or more letters — i.e. an actual word. A rendered body without
-# even one has no readable text and is an empty shell, even when not strictly
-# whitespace: a partly-rendered JS page can leave stray punctuation like "; ;"
-# that defeats a bare `.strip()` test.
-_WORD_RE = re.compile(r"[^\W\d_]{2,}")
+def _link_text(m: "re.Match[str]") -> str:
+    """Replacement text for a matched link: its anchor, or nothing for a
+    citation marker."""
+    anchor = m.group(2).strip()
+    return "" if _CITATION_ANCHOR_RE.match(anchor) else anchor
 
-# An 11-character YouTube video ID.
-_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+def _markdown_links(md: str) -> List[Tuple[str, str]]:
+    """``(anchor_text, absolute_url)`` pairs for the non-image links in `md`.
+
+    A citation marker (``[[12]](https://source)``, already resolved by
+    fetch_page to the footnote's external source) has no useful anchor text, so
+    the sentence it is attached to — the text just before it on the same line —
+    stands in. That lets multi-hop rank a page's primary sources by the claim
+    they support.
+    """
+    md = md or ""
+    out: List[Tuple[str, str]] = []
+    for m in _MD_LINK_RE.finditer(md):
+        bang, anchor, url = m.group(1), m.group(2).strip(), m.group(3)
+        if bang or anchor.startswith(_IMAGE_MARKER_PREFIX):
+            continue
+        if _CITATION_ANCHOR_RE.match(anchor):
+            line_start = md.rfind("\n", 0, m.start()) + 1
+            before = md[max(line_start, m.start() - _CITATION_CONTEXT_CHARS) : m.start()]
+            anchor = _MD_LINK_RE.sub(_link_text, before).strip()
+        out.append((anchor, url))
+    return out
+
+
+def _markdown_to_text(md: str) -> str:
+    """Flatten fetch_page markdown to plain lines for relevance scoring.
+
+    Links and images become their anchor/alt text (citation markers vanish),
+    heading anchors, list/quote/heading markers, rules, and emphasis are
+    dropped, and blank lines collapse. Line breaks are kept so ``_segments``
+    scores paragraphs individually.
+    """
+    text = _MD_HEADING_ANCHOR_RE.sub("", md or "")
+    text = _MD_LINK_RE.sub(_link_text, text)
+    text = _MD_RULE_RE.sub("", text)
+    text = _MD_LINE_PREFIX_RE.sub("", text)
+    text = re.sub(r"\*{1,3}|`+", "", text)
+    return re.sub(r"\n\s*\n+", "\n", text).strip()
+
 
 # Query-string parameters that are tracking/analytics noise rather than content
 # selectors. Stripped when building a URL's dedup key so the same article linked
@@ -228,212 +381,6 @@ _TRACKING_PARAMS = frozenset(
         "_hsmi",
     }
 )
-
-
-# ---------------------------------------------------------------------------
-# SSRF guard (ported from the fetch_page MCP tool)
-#
-# URLs reach the pipe from search results and from in-page links it follows
-# (multi-hop), so an attacker can use indirect prompt injection to steer a fetch
-# at internal targets — cloud metadata (169.254.169.254), localhost, or LAN
-# hosts. Every URL — and every redirect hop — is resolved and refused unless it
-# is publicly routable. Operators can opt specific hosts/IPs/CIDRs back in via
-# the SSRF_ALLOWLIST valve.
-# ---------------------------------------------------------------------------
-
-MAX_REDIRECTS = 20
-
-
-class SSRFError(RuntimeError):
-    """A fetch target's host resolved to a non-public (blocked) address."""
-
-
-class DownloadTooLargeError(RuntimeError):
-    """A response body exceeded the configured download-size cap."""
-
-
-@lru_cache(maxsize=8)
-def _parse_allowlist(raw: str) -> Tuple[frozenset, Tuple]:
-    """Parse the SSRF allowlist string into (hostnames, ip-networks).
-
-    Entries are comma/whitespace-separated; each is either an IP/CIDR (matched
-    against resolved addresses) or a hostname (matched verbatim against the URL
-    host, case-insensitive). Cached since the valve string is a fixed value.
-    """
-    hosts: set = set()
-    nets: list = []
-    for item in re.split(r"[,\s]+", (raw or "").strip()):
-        if not item:
-            continue
-        try:
-            nets.append(ipaddress.ip_network(item, strict=False))
-        except ValueError:
-            hosts.add(item.lower())
-    return frozenset(hosts), tuple(nets)
-
-
-def _ip_of(addr: str):
-    """Parse a resolved address into an ip_address, unwrapping IPv4-mapped IPv6
-    (e.g. ::ffff:169.254.169.254) so the v4 rules apply. None if unparseable."""
-    try:
-        ip = ipaddress.ip_address(addr.split("%")[0])  # drop any IPv6 scope id
-    except ValueError:
-        return None
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return ip
-
-
-def _addr_is_blocked(addr: str, allowed_nets: Tuple = ()) -> bool:
-    """True if `addr` is not a globally-routable public IP (loopback, private,
-    link-local, reserved, CGNAT, …) and not covered by an allowlisted network —
-    or unparseable, in which case refuse."""
-    ip = _ip_of(addr)
-    if ip is None:
-        return True
-    if ip.is_global:
-        return False
-    return not any(ip.version == n.version and ip in n for n in allowed_nets)
-
-
-async def _assert_url_allowed(url: str, allowlist: str = "") -> None:
-    """Raise SSRFError unless `url` is http(s) and its host is allowed: either
-    explicitly allowlisted, or resolving only to public addresses. DNS
-    resolution is offloaded so the event loop isn't blocked."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise SSRFError(f"Refusing non-http(s) URL: {url!r}")
-    host = parsed.hostname or ""
-    if not host:
-        raise SSRFError(f"Refusing URL with no host: {url!r}")
-    allowed_hosts, allowed_nets = _parse_allowlist(allowlist)
-    if host.lower() in allowed_hosts:
-        return
-    literal_ip = _ip_of(host)
-    if literal_ip is not None:
-        if _addr_is_blocked(host, allowed_nets):
-            raise SSRFError(
-                f"Refusing to fetch {host!r}: non-public address (allowlist via "
-                "SSRF_ALLOWLIST)"
-            )
-        return
-    try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
-    except socket.gaierror as e:
-        raise SSRFError(f"Could not resolve host {host!r}: {e}")
-    blocked = sorted(
-        {info[4][0] for info in infos if _addr_is_blocked(info[4][0], allowed_nets)}
-    )
-    if blocked:
-        raise SSRFError(
-            f"Refusing to fetch {host!r}: resolves to non-public address(es) "
-            f"{', '.join(blocked)} (allowlist via SSRF_ALLOWLIST)"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Charset-aware decoding (ported from the fetch_page MCP tool)
-#
-# A large slice of the web is served in a non-UTF-8 encoding (Cyrillic
-# windows-1251, Japanese Shift_JIS, Korean EUC-KR, Western windows-1252, …);
-# decoding those blindly as UTF-8 turns every non-ASCII character into a
-# replacement glyph. We resolve the charset like a browser: HTTP Content-Type
-# header, then an in-document <meta charset>, then statistical detection, then
-# UTF-8 as a floor.
-# ---------------------------------------------------------------------------
-
-_CHARSET_PARAM_RE = re.compile(r"charset\s*=\s*([a-zA-Z0-9_\-:.]+)", re.I)
-_META_CHARSET_RE = re.compile(
-    rb"""<meta[^>]+?charset\s*=\s*["']?\s*([a-zA-Z0-9_\-:.]+)""", re.I
-)
-
-
-def _normalize_codec(name: Optional[str]) -> Optional[str]:
-    """Return the canonical codec name if `name` is a real encoding, else None."""
-    if not name:
-        return None
-    try:
-        return codecs.lookup(name.strip().strip("\"'")).name
-    except (LookupError, TypeError, ValueError):
-        return None
-
-
-def _charset_from_ctype(ctype: str) -> Optional[str]:
-    """Extract the ``charset=`` value from a Content-Type header, if any."""
-    m = _CHARSET_PARAM_RE.search(ctype or "")
-    return m.group(1) if m else None
-
-
-def _decode_body(body: bytes, ctype: str) -> str:
-    """Decode page bytes to text using the declared/detected charset.
-
-    Precedence mirrors a browser: (1) the HTTP ``Content-Type`` charset, (2) a
-    ``<meta charset>`` declaration in the document head, (3) UnicodeDammit's
-    statistical detection (when bs4 is available), and (4) UTF-8 with
-    replacement as a floor that never raises.
-    """
-    if not body:
-        return ""
-    header_enc = _normalize_codec(_charset_from_ctype(ctype))
-    meta_match = _META_CHARSET_RE.search(body[:4096])
-    meta_enc = (
-        _normalize_codec(meta_match.group(1).decode("ascii", "ignore"))
-        if meta_match
-        else None
-    )
-
-    # A declared charset that actually decodes the bytes cleanly wins outright.
-    for enc in (header_enc, meta_enc):
-        if enc:
-            try:
-                return body.decode(enc)
-            except (UnicodeDecodeError, LookupError):
-                pass
-
-    # Otherwise let UnicodeDammit detect (preferring the declared encodings as
-    # overrides and handling BOMs / Microsoft smart-quote bytes), when available.
-    if _UNICODE_DAMMIT is not None:
-        overrides = [e for e in (header_enc, meta_enc) if e]
-        try:
-            dammit = _UNICODE_DAMMIT(body, override_encodings=overrides, is_html=True)
-            if dammit.unicode_markup is not None:
-                return dammit.unicode_markup
-        except Exception:
-            pass
-
-    return body.decode("utf-8", errors="replace")
-
-
-def _sniff_document_bytes(body: Optional[bytes]) -> bool:
-    """True if the leading bytes look like a Tika-extractable binary document.
-
-    The last line of defence when neither the content-type nor the URL extension
-    reveals the type — e.g. a PDF served as ``application/octet-stream`` (or even
-    mislabelled ``text/html``) from an extensionless ``/download?id=`` URL.
-    Without this the binary would be decoded into garbage and returned as page
-    text. Only unambiguous signatures are matched; a plain ZIP is accepted only
-    when it carries an Office/OpenDocument/EPUB marker, never as a bare archive.
-    """
-    if not body:
-        return False
-    head = body[:8]
-    if head.startswith(b"%PDF"):
-        return True
-    if head.startswith(b"{\\rtf"):
-        return True
-    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):  # OLE2: legacy doc/xls/ppt
-        return True
-    if head.startswith(b"PK\x03\x04"):
-        # A ZIP container — only a document if it's an OOXML/ODF/EPUB package.
-        sample = body[:2000]
-        return (
-            b"word/" in sample
-            or b"xl/" in sample
-            or b"ppt/" in sample
-            or b"mimetypeapplication/epub+zip" in sample
-            or b"mimetypeapplication/vnd.oasis.opendocument" in sample
-        )
-    return False
 
 
 def _extract_json(raw: str) -> Any:
@@ -548,9 +495,10 @@ def _tokenize(text: str) -> List[str]:
 def _segments(text: str) -> List[str]:
     """Split text into scoring units (~sentences / short paragraphs).
 
-    Robust to ``_html_to_text`` collapsing a page into one long line (it splits
-    such a blob into sentences) and to documents/transcripts that keep newlines
-    (split per line first). Blank fragments are dropped.
+    Splits per line first (fetch_page markdown, documents, and search excerpts
+    keep newlines), then breaks any over-long line — a transcript or a page
+    flattened into one blob — into sentence-ish chunks. Blank fragments are
+    dropped.
     """
     out: List[str] = []
     for para in re.split(r"\n+", text or ""):
@@ -603,11 +551,12 @@ def _cosine(a: List[float], b: List[float]) -> float:
 # ---------------------------------------------------------------------------
 # Publish-date handling
 #
-# SearXNG reports a source's publish date inconsistently (ISO 8601, RFC 822, a
-# bare year, …) and only for some engines. We parse it best-effort to: surface
-# it in the report's reference list, break relevance ties toward fresher sources
-# when the plan flagged the topic as time-sensitive, and flag clearly stale
-# sources. Anything unparseable is simply treated as "no date" — never an error.
+# search_web reports a provider page date (``page_date``) only for some results,
+# and its format isn't guaranteed (ISO 8601, RFC 822, a bare year, …). We parse
+# it best-effort to: surface it in the report's reference list, break relevance
+# ties toward fresher sources when the plan flagged the topic as time-sensitive,
+# and flag clearly stale sources. Anything unparseable is simply treated as "no
+# date" — never an error.
 # ---------------------------------------------------------------------------
 
 # How old (in days) a source may be before it's flagged "may be outdated",
@@ -635,7 +584,7 @@ def _to_naive_utc(dt: datetime) -> datetime:
 
 
 def _parse_date(raw: Optional[str]) -> Optional[datetime]:
-    """Best-effort parse of a SearXNG publish date into a naive-UTC datetime.
+    """Best-effort parse of a search result's page date into a naive-UTC datetime.
 
     Tries ISO 8601 (tolerating a trailing ``Z``), then a handful of common
     formats, then a leading ``YYYY-MM-DD`` or bare ``YYYY``. Returns ``None`` for
@@ -801,45 +750,54 @@ class Pipe:
             ),
         )
 
-        # --- Search engine ---
-        SEARXNG_URL: str = Field(
-            default="http://searxng:8080",
-            description="Base URL of your SearXNG instance.",
-        )
-        SEARCH_RESULTS_PER_QUERY: int = Field(
-            default=10,
-            description="Number of search results per query.",
-        )
-        SEARCH_ENGINES: str = Field(
+        # --- MCP server (search_web + fetch_page) ---
+        MCP_SERVER_ID: str = Field(
             default="",
             description=(
-                "Comma-separated SearXNG engines "
-                "(e.g. 'google,bing,duckduckgo'). "
-                "Blank = SearXNG defaults."
+                "ID of the MCP tool server (Admin Settings → External Tools) "
+                "that provides search_web and fetch_page. Blank = auto-detect: "
+                "use the server's tools when it is enabled for the chat, else "
+                "connect to the first enabled MCP connection that exposes both "
+                "tools."
+            ),
+        )
+        SEARCH_RESULTS_PER_QUERY: int = Field(
+            default=5,
+            description=(
+                "Max results per search_web query (passed as num_results; the "
+                "MCP server clamps it to its own configured cap). 0 = the "
+                "server's cap."
             ),
         )
         SEARCH_TIME_RANGE: str = Field(
             default="",
             description=(
-                "Recency filter applied to every search: '', 'day', 'week', "
-                "'month', or 'year'. Blank = no restriction. The research plan's "
-                "own recency hint overrides this per run."
+                "Freshness filter applied to every search: '', 'day', 'week', "
+                "'month', 'year', 'all', or 'YYYY-MM-DD to YYYY-MM-DD'. Blank = "
+                "the server's default. The research plan's own recency hint "
+                "overrides this per run."
             ),
         )
-
-        # --- FlareSolverr (optional) ---
-        FLARESOLVERR_URL: str = Field(
-            default="",
+        MAX_PAGE_FETCHES_PER_CYCLE: int = Field(
+            default=10,
             description=(
-                "FlareSolverr URL (e.g. http://flaresolverr:8191/v1). "
-                "Blank = disabled."
+                "How many new search results per cycle are read in full with "
+                "fetch_page. The rest (and any page that can't be read) still "
+                "contribute their search_web excerpts. 0 = excerpts only (much "
+                "faster, shallower)."
             ),
         )
-
-        # --- Apache Tika (PDF extraction) ---
-        TIKA_URL: str = Field(
-            default="http://tika:9998",
-            description="Base URL of your Apache Tika server used for PDF text extraction.",
+        MAX_CONCURRENT_FETCHES: int = Field(
+            default=5,
+            description="Max fetch_page calls in flight at once.",
+        )
+        TOOL_CALL_TIMEOUT: int = Field(
+            default=180,
+            description=(
+                "Seconds the pipe waits for one search_web/fetch_page call "
+                "before giving up on it (the source then falls back to its "
+                "search excerpts). 0 = rely on the server's own deadlines."
+            ),
         )
 
         # --- Snippet / context control ---
@@ -901,13 +859,6 @@ class Pipe:
                 "plan. 0 disables (plan + reactive gap-filling only)."
             ),
         )
-        CYCLE_DELAY_SECONDS: float = Field(
-            default=0.0,
-            description=(
-                "Seconds to pause between research cycles. Raise (e.g. 2-5) if "
-                "SearXNG or source sites rate-limit you. 0 = no delay."
-            ),
-        )
 
         # --- Report length control ---
         SECTION_MIN_WORDS: int = Field(
@@ -959,59 +910,10 @@ class Pipe:
             ),
         )
 
-        # --- Fetch settings ---
-        PAGE_FETCH_TIMEOUT: int = Field(
-            default=15,
-            description="Timeout (seconds) for fetching web pages.",
-        )
-        MAX_CONCURRENT_FETCHES: int = Field(
-            default=5,
-            description="Max pages to fetch concurrently.",
-        )
-        MAX_DOWNLOAD_BYTES: int = Field(
-            default=104857600,  # 100 MiB
-            description=(
-                "Maximum bytes a single page fetch may download before it is "
-                "aborted (0 = unbounded). The cap is on the decompressed stream, "
-                "so it also bounds a decompression bomb, protecting the process "
-                "from a multi-GB body exhausting memory. Sized for the largest "
-                "reasonable document (an image-heavy PDF, which Tika reduces to "
-                "plain text)."
-            ),
-        )
-        SSRF_ALLOWLIST: str = Field(
-            default="",
-            description=(
-                "Comma/space-separated hosts, IPs, or CIDRs that bypass the SSRF "
-                "guard so the pipe may reach a trusted local/private page you host "
-                "(e.g. 'localhost,127.0.0.1,192.168.1.50,10.0.0.0/8'). Applies to "
-                "redirect targets too. Empty = block all non-public addresses. "
-                "Note: your SearXNG/FlareSolverr/Tika service hosts are contacted "
-                "directly and are not subject to this guard."
-            ),
-        )
-        VERIFY_SSL: bool = Field(
-            default=True,
-            description=(
-                "Verify TLS certificates when fetching pages. Leave on; disable "
-                "only if you must fetch sources with broken/self-signed certs."
-            ),
-        )
-
         # --- Behaviour ---
         SKIP_PLAN_CONFIRMATION: bool = Field(
             default=False,
             description="Skip the user-confirmation step for the plan.",
-        )
-        WAYBACK_FALLBACK: bool = Field(
-            default=True,
-            description=(
-                "When True, a page that stays blocked (bot wall / 429) or "
-                "renders empty after the direct fetch and FlareSolverr is "
-                "retried from the Internet Archive's Wayback Machine. "
-                "Recovered text is clearly flagged as a possibly-stale archived "
-                "snapshot. Needs no extra service (public archive.org API)."
-            ),
         )
 
     # -----------------------------------------------------------------------
@@ -1165,742 +1067,6 @@ class Pipe:
         )
 
     # -----------------------------------------------------------------------
-    # Web fetching
-    # -----------------------------------------------------------------------
-    _BROWSER_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,*/*;q=0.8"
-        ),
-    }
-
-    @staticmethod
-    def _cap_words(text: str, max_words: int) -> str:
-        """Hard-cap `text` to `max_words` words (a memory/CPU bound, not the
-        relevance budget — that's applied later by `_extract_relevant`)."""
-        words = (text or "").split()
-        if max_words > 0 and len(words) > max_words:
-            return " ".join(words[:max_words])
-        return text
-
-    _A_TAG_RE = re.compile(
-        r'<a\b[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-        re.IGNORECASE | re.DOTALL,
-    )
-
-    @classmethod
-    def _extract_links(cls, html: str, base_url: str) -> List[Tuple[str, str]]:
-        """Pull ``(anchor_text, absolute_href)`` pairs from page HTML.
-
-        Best-effort regex harvest (the pipe flattens HTML to text elsewhere, so
-        links would otherwise be lost). Relative hrefs are resolved against
-        `base_url`; fragments/mailto/js are skipped. Feeds multi-hop following.
-        """
-        out: List[Tuple[str, str]] = []
-        for href, inner in cls._A_TAG_RE.findall(html or ""):
-            href = href.strip()
-            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
-                continue
-            anchor = re.sub(r"<[^>]+>", " ", inner)
-            anchor = re.sub(r"\s+", " ", anchor).strip()
-            try:
-                abs_href = urljoin(base_url, href)
-            except Exception:
-                continue
-            if abs_href.lower().startswith(("http://", "https://")):
-                out.append((anchor, abs_href))
-        return out
-
-    @staticmethod
-    def _page(
-        url: str,
-        text: str,
-        *,
-        links: Optional[List[Tuple[str, str]]] = None,
-        kind: str = "html",
-    ) -> Dict[str, Any]:
-        """Build the raw-fetch result the research loop consumes. ``text`` is the
-        fuller readable content (relevance extraction happens later); ``links``
-        are in-page links for multi-hop; ``kind`` records how it was fetched."""
-        return {"url": url, "text": text or "", "links": links or [], "kind": kind}
-
-    @staticmethod
-    def _is_tika_document(ctype: str, url: str) -> bool:
-        """True if the response looks like a binary document Tika should extract."""
-        ctype = (ctype or "").lower()
-        if any(ctype.startswith(c) for c in TIKA_DOCUMENT_CTYPES):
-            return True
-        # Fall back on the URL path when the server sends a generic content-type
-        # (e.g. application/octet-stream) but the extension is telling.
-        try:
-            path = (urlparse(url).path or "").lower()
-        except Exception:
-            return False
-        return path.endswith(TIKA_DOCUMENT_EXTENSIONS)
-
-    @staticmethod
-    def _is_contentless(body: str) -> bool:
-        """True if `body` has no readable text (not one word of 2+ letters)."""
-        return not _WORD_RE.search(body or "")
-
-    @staticmethod
-    def _is_blocked_response(status: int, text: str, headers: Dict) -> bool:
-        """Best-effort detection that a response is a bot wall / CAPTCHA / throttle.
-
-        Covers Cloudflare plus PerimeterX/HUMAN, DataDome, and Akamai Bot Manager
-        — each of which serves a challenge under one of ``BLOCK_STATUS_CODES`` (or
-        a bare 200) carrying its own marker rather than the page's real content —
-        and any HTTP 429, which is definitionally a throttle and never real data.
-        """
-        # 429 is always a rate-limit/throttle and never carries real content; a
-        # real browser (FlareSolverr) often clears it, so treat it as a block.
-        if status == 429:
-            return True
-        hdr_lower = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
-        server = hdr_lower.get("server", "")
-        set_cookie = hdr_lower.get("set-cookie", "")
-        if "cloudflare" in server and status in BLOCK_STATUS_CODES:
-            return True
-        if status in BLOCK_STATUS_CODES:
-            if (
-                "x-datadome" in hdr_lower
-                or "datadome" in set_cookie
-                or "_px" in set_cookie
-            ):
-                return True
-            t = (text or "")[:8000].lower()
-            if any(m in t for m in ALL_BLOCK_MARKERS):
-                return True
-        if status == 200 and text:
-            t = text[:4000].lower()
-            if sum(1 for m in ALL_BLOCK_MARKERS if m in t) >= 2:
-                return True
-        return False
-
-    async def _http_get(
-        self, session: aiohttp.ClientSession, url: str
-    ) -> Tuple[int, Dict[str, str], bytes, str]:
-        """SSRF-guarded GET with manual redirect following and a download cap.
-
-        Returns ``(status, headers, body_bytes, content_type)``. Redirects are
-        followed by hand (not aiohttp's ``allow_redirects``) so each hop's target
-        passes the SSRF guard before we connect to it. The body is streamed and
-        aborted once it passes ``MAX_DOWNLOAD_BYTES`` (0 = unbounded). Raises
-        ``SSRFError`` (initial URL or a redirect hop resolved to a non-public
-        address) or ``DownloadTooLargeError``; other failures propagate as the
-        underlying aiohttp exception.
-        """
-        await _assert_url_allowed(url, self.valves.SSRF_ALLOWLIST)
-        max_bytes = self.valves.MAX_DOWNLOAD_BYTES
-        current = url
-        for _ in range(MAX_REDIRECTS + 1):
-            async with session.get(
-                current,
-                headers=self._BROWSER_HEADERS,
-                allow_redirects=False,
-                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
-                ssl=self.valves.VERIFY_SSL,
-            ) as resp:
-                location = resp.headers.get("Location")
-                if resp.status in (301, 302, 303, 307, 308) and location:
-                    current = urljoin(current, location)
-                    await _assert_url_allowed(current, self.valves.SSRF_ALLOWLIST)
-                    continue
-                chunks: List[bytes] = []
-                total = 0
-                async for chunk in resp.content.iter_chunked(65536):
-                    total += len(chunk)
-                    if max_bytes and total > max_bytes:
-                        raise DownloadTooLargeError(
-                            f"Response from {current!r} exceeds the "
-                            f"{max_bytes}-byte download cap (MAX_DOWNLOAD_BYTES)."
-                        )
-                    chunks.append(chunk)
-                ctype = resp.headers.get("Content-Type", "")
-                return resp.status, dict(resp.headers), b"".join(chunks), ctype
-        raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
-
-    async def _fetch_page(
-        self, session: aiohttp.ClientSession, url: str
-    ) -> Dict[str, Any]:
-        """Fetch one URL through a resilient fallback ladder.
-
-        Returns a page dict ``{url, text, links, kind}`` (see `_page`); ``text``
-        is the fuller readable content (relevance extraction is applied later by
-        the loop) and is empty when nothing usable could be recovered. The
-        ladder: Reddit JSON → YouTube transcript → direct GET (document→Tika),
-        and on a bot wall / 429 / empty JS shell, FlareSolverr and then the
-        Wayback Machine. A challenge page we can't get past comes back with empty
-        text rather than as if it were content. ``links`` carries the page's
-        in-page links (HTML fetches only) for multi-hop following.
-        """
-        cap = _RELEVANCE_SCAN_MAX_WORDS
-
-        # SSRF guard up front, before ANY fetch path (Reddit JSON, FlareSolverr,
-        # the direct GET): the URL came from a search result or a followed
-        # in-page link, so refuse a non-public target rather than handing it to a
-        # fetcher. (Redirect hops are re-checked inside `_http_get`.)
-        try:
-            await _assert_url_allowed(url, self.valves.SSRF_ALLOWLIST)
-        except SSRFError as e:
-            log.debug(f"SSRF-blocked URL {url}: {e}")
-            return self._page(url, "", kind="blocked")
-
-        # Reddit serves anti-bot HTML; route through its public .json endpoint.
-        if self._is_reddit_url(url):
-            text = await self._fetch_reddit(session, url)
-            return self._page(url, self._cap_words(text, cap), kind="reddit")
-
-        # A YouTube video's real content is its transcript, not the watch page.
-        if _YT_AVAILABLE and self._is_youtube_video_url(url):
-            transcript = await self._fetch_youtube_transcript(url)
-            if transcript:
-                return self._page(url, self._cap_words(transcript, cap), kind="youtube")
-            # No captions / blocked IP — fall through to a normal HTML fetch.
-
-        status = 0
-        headers: Dict[str, str] = {}
-        raw_html = ""
-        is_doc = False
-        body_bytes = b""
-        try:
-            status, headers, body_bytes, ct = await self._http_get(session, url)
-            # Route binary documents (PDF/Office/OpenDocument/RTF/EPUB) to Tika —
-            # detected by content-type/extension OR a magic-byte sniff, which also
-            # catches a document mislabelled as text/html or octet-stream.
-            # Everything else is charset-decoded so block detection, link
-            # extraction, and text rendering see correctly-decoded characters
-            # rather than a blind UTF-8 reading that garbles non-UTF-8 pages.
-            if self._is_tika_document(ct, url) or _sniff_document_bytes(body_bytes):
-                is_doc = True
-            else:
-                raw_html = _decode_body(body_bytes, ct)
-        except (SSRFError, DownloadTooLargeError) as e:
-            # A redirect hop resolved to a blocked host, or the body blew past the
-            # size cap — refuse outright rather than re-fetching the same URL
-            # through FlareSolverr (a real browser that would re-download it).
-            log.debug(f"Refusing {url}: {e}")
-            return self._page(url, "", kind="blocked")
-        except Exception as e:
-            log.debug(f"Direct fetch failed for {url}: {e}")
-
-        if is_doc:
-            extracted = await self._extract_document(session, body_bytes)
-            return self._page(url, self._cap_words(extracted, cap), kind="document")
-
-        blocked = self._is_blocked_response(status, raw_html, headers) if status else False
-        rendered_text = self._html_to_text(raw_html) if raw_html else ""
-        # A bot wall, a throttle, or a 200 that rendered to no readable text (a
-        # client-side-rendered SPA whose body loads via XHR) all need a real
-        # browser or an archive to recover.
-        need_fallback = blocked or self._is_contentless(rendered_text)
-
-        # Tier 1: FlareSolverr renders the page's JS in a real browser.
-        if need_fallback and self.valves.FLARESOLVERR_URL:
-            fs_html, fs_status, fs_headers = await self._flaresolverr(session, url)
-            if fs_html:
-                fs_blocked = self._is_blocked_response(
-                    fs_status or 200, fs_html, fs_headers
-                )
-                fs_text = self._html_to_text(fs_html)
-                if fs_text and not fs_blocked and not self._is_contentless(fs_text):
-                    return self._page(
-                        url,
-                        self._cap_words(fs_text, cap),
-                        links=self._extract_links(fs_html, url),
-                        kind="flaresolverr",
-                    )
-                # FlareSolverr returning a page isn't a bypass — an interactive
-                # wall (PerimeterX "Press & Hold", a CAPTCHA) renders as an
-                # ordinary page it can't solve. Keep the block flag and try the
-                # archive next.
-                blocked = blocked or fs_blocked
-
-        # Tier 2: a Wayback snapshot may hold text the live page now hides/blocks.
-        if need_fallback and self.valves.WAYBACK_FALLBACK:
-            archived = await self._fetch_from_wayback(session, url)
-            if archived:
-                wb_text, wb_date = archived
-                note = (
-                    f"[Archived snapshot from {wb_date} via the Wayback Machine; "
-                    "the live page was unavailable, so this may be out of date.]\n"
-                )
-                return self._page(
-                    url, note + self._cap_words(wb_text, cap), kind="archive"
-                )
-
-        # Don't surface an unbypassed challenge page as if it were content.
-        if blocked:
-            return self._page(url, "", kind="blocked")
-        return self._page(
-            url,
-            self._cap_words(rendered_text, cap),
-            links=self._extract_links(raw_html, url),
-            kind="html",
-        )
-
-    # -----------------------------------------------------------------------
-    # Reddit JSON endpoint handling
-    # -----------------------------------------------------------------------
-    @staticmethod
-    def _is_reddit_url(url: str) -> bool:
-        """Detect reddit.com URLs (including subdomains like old./www./np.)."""
-        try:
-            lower = url.lower()
-            # Match http(s)://...reddit.com/ — catches www, old, np, i, etc.
-            return bool(
-                re.match(r"^https?://([a-z0-9-]+\.)?reddit\.com(/|$)", lower)
-            )
-        except Exception:
-            return False
-
-    @staticmethod
-    def _reddit_json_url(url: str) -> str:
-        """Convert a Reddit URL into its .json equivalent.
-
-        - Strips query string and fragment (Reddit's JSON endpoint ignores
-          most query params and some actively break it).
-        - Removes a trailing slash.
-        - Appends .json if not already present.
-        """
-        # Drop fragment
-        u = url.split("#", 1)[0]
-        # Drop query string
-        u = u.split("?", 1)[0]
-        # Drop trailing slash
-        if u.endswith("/"):
-            u = u[:-1]
-        if not u.endswith(".json"):
-            u = u + ".json"
-        return u
-
-    async def _fetch_reddit(
-        self, session: aiohttp.ClientSession, url: str
-    ) -> str:
-        """Fetch a Reddit post/comments/listing via the public .json endpoint
-        and render it into plain text suitable for the research pipeline."""
-        json_url = self._reddit_json_url(url)
-        try:
-            async with session.get(
-                json_url,
-                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
-                headers={
-                    # A descriptive, non-browser UA works best with Reddit's
-                    # JSON endpoint — browser UAs are more likely to get
-                    # rate-limited / blocked.
-                    "User-Agent": (
-                        "deep-research-pipe/1.2 "
-                        "(+https://github.com/open-webui)"
-                    ),
-                    "Accept": "application/json",
-                },
-                allow_redirects=True,
-                ssl=self.valves.VERIFY_SSL,
-            ) as resp:
-                if resp.status != 200:
-                    log.debug(
-                        f"Reddit JSON fetch returned {resp.status} for {json_url}"
-                    )
-                    return ""
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception as e:
-                    log.debug(f"Reddit JSON parse failed for {json_url}: {e}")
-                    return ""
-        except Exception as e:
-            log.debug(f"Reddit JSON fetch failed for {json_url}: {e}")
-            return ""
-
-        return self._render_reddit_json(data)
-
-    @staticmethod
-    def _render_reddit_json(data: Any) -> str:
-        """Render Reddit's JSON response into readable plain text.
-
-        Handles both the single-post format (list of two Listings: post +
-        comments) and the subreddit/listing format (one Listing of posts).
-        """
-        def _strip_html(s: str) -> str:
-            if not s:
-                return ""
-            s = re.sub(r"<[^>]+>", " ", s)
-            for ent, ch in [
-                ("&amp;", "&"),
-                ("&lt;", "<"),
-                ("&gt;", ">"),
-                ("&quot;", '"'),
-                ("&#39;", "'"),
-                ("&nbsp;", " "),
-            ]:
-                s = s.replace(ent, ch)
-            return re.sub(r"\s+", " ", s).strip()
-
-        def _walk_comments(children: List[Dict], depth: int = 0) -> List[str]:
-            out: List[str] = []
-            for child in children:
-                kind = child.get("kind")
-                cdata = child.get("data", {}) or {}
-                if kind != "t1":
-                    # Skip "more" stubs and anything non-comment
-                    continue
-                body = (cdata.get("body") or "").strip()
-                if not body or body in ("[deleted]", "[removed]"):
-                    continue
-                author = cdata.get("author") or "unknown"
-                score = cdata.get("score")
-                score_str = f" ({score} pts)" if score is not None else ""
-                indent = "  " * min(depth, 4)
-                out.append(f"{indent}- {author}{score_str}: {body}")
-                # Recurse into replies
-                replies = cdata.get("replies")
-                if isinstance(replies, dict):
-                    reply_children = (
-                        replies.get("data", {}).get("children", []) or []
-                    )
-                    out.extend(_walk_comments(reply_children, depth + 1))
-            return out
-
-        parts: List[str] = []
-
-        # Single post + comments: [post_listing, comments_listing]
-        if isinstance(data, list) and len(data) >= 1:
-            post_listing = data[0]
-            post_children = (
-                post_listing.get("data", {}).get("children", []) or []
-            )
-            if post_children:
-                post = post_children[0].get("data", {}) or {}
-                title = (post.get("title") or "").strip()
-                author = post.get("author") or "unknown"
-                subreddit = post.get("subreddit") or ""
-                score = post.get("score")
-                selftext = _strip_html(post.get("selftext") or "")
-                link_url = post.get("url") or ""
-
-                if title:
-                    parts.append(f"Title: {title}")
-                if subreddit:
-                    parts.append(f"Subreddit: r/{subreddit}")
-                parts.append(f"Author: u/{author}")
-                if score is not None:
-                    parts.append(f"Score: {score}")
-                if selftext:
-                    parts.append(f"\nPost body:\n{selftext}")
-                elif link_url and link_url not in (
-                    post.get("permalink", ""),
-                    "",
-                ):
-                    parts.append(f"Linked URL: {link_url}")
-
-            # Comments
-            if len(data) >= 2:
-                comment_listing = data[1]
-                comment_children = (
-                    comment_listing.get("data", {}).get("children", []) or []
-                )
-                rendered = _walk_comments(comment_children)
-                if rendered:
-                    parts.append("\nTop comments:")
-                    parts.extend(rendered)
-
-        # Listing of posts (e.g. /r/subreddit.json, /r/subreddit/top.json)
-        elif isinstance(data, dict) and data.get("kind") == "Listing":
-            children = data.get("data", {}).get("children", []) or []
-            for child in children:
-                cdata = child.get("data", {}) or {}
-                title = (cdata.get("title") or "").strip()
-                if not title:
-                    continue
-                author = cdata.get("author") or "unknown"
-                subreddit = cdata.get("subreddit") or ""
-                score = cdata.get("score")
-                selftext = _strip_html(cdata.get("selftext") or "")
-                header = f"- [{score} pts] r/{subreddit} — {title} (by u/{author})"
-                parts.append(header)
-                if selftext:
-                    # Keep listing entries compact
-                    snippet = selftext[:400]
-                    if len(selftext) > 400:
-                        snippet += "…"
-                    parts.append(f"  {snippet}")
-
-        return "\n".join(parts).strip()
-
-    async def _flaresolverr(
-        self, session: aiohttp.ClientSession, url: str
-    ) -> Tuple[str, int, Dict]:
-        """Render `url` through FlareSolverr (a real browser that runs the page's
-        JS and clears Cloudflare-style walls).
-
-        Returns ``(html, status, headers)`` from the solved page so the caller
-        can re-run block detection on what FlareSolverr actually got — a page it
-        returns may still be an interactive challenge it couldn't solve.
-        ``("", 0, {})`` on any failure.
-        """
-        try:
-            async with session.post(
-                self.valves.FLARESOLVERR_URL,
-                json={
-                    "cmd": "request.get",
-                    "url": url,
-                    "maxTimeout": self.valves.PAGE_FETCH_TIMEOUT * 1000,
-                },
-                timeout=aiohttp.ClientTimeout(
-                    total=self.valves.PAGE_FETCH_TIMEOUT + 30
-                ),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    sol = data.get("solution", {}) or {}
-                    html = sol.get("response", "") or ""
-                    fs_status = int(sol.get("status") or 0)
-                    fs_headers = sol.get("headers") or {}
-                    return html, fs_status, fs_headers
-        except Exception as e:
-            log.debug(f"FlareSolverr failed for {url}: {e}")
-        return "", 0, {}
-
-    @staticmethod
-    def _html_to_text(html: str) -> str:
-        text = re.sub(
-            r"<(script|style|noscript)[^>]*>.*?</\1>",
-            "",
-            html,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        text = re.sub(r"<[^>]+>", " ", text)
-        for ent, ch in [
-            ("&amp;", "&"),
-            ("&lt;", "<"),
-            ("&gt;", ">"),
-            ("&quot;", '"'),
-            ("&#39;", "'"),
-            ("&nbsp;", " "),
-        ]:
-            text = text.replace(ent, ch)
-        return re.sub(r"\s+", " ", text).strip()
-
-    async def _extract_document(
-        self, session: aiohttp.ClientSession, data: bytes
-    ) -> str:
-        """Extract plain text from a document byte stream via Apache Tika.
-
-        No Content-Type is sent: Tika auto-detects the format from the bytes, so
-        this one path handles PDF, Office (doc/docx/xls/xlsx/ppt/pptx),
-        OpenDocument, RTF and EPUB. ``X-Tika-PDFOcrStrategy: no_ocr`` keeps it to
-        embedded text (fast; avoids OCR of image-heavy PDFs blowing the timeout).
-
-        Reuses the run's shared `session` rather than standing up a fresh
-        ``ClientSession`` (and connector) per document.
-        """
-        if not data:
-            return "[Document returned no content]"
-        try:
-            tika_url = f"{self.valves.TIKA_URL.rstrip('/')}/tika"
-            async with session.put(
-                tika_url,
-                data=data,
-                headers={
-                    "Accept": "text/plain",
-                    "X-Tika-PDFOcrStrategy": "no_ocr",
-                },
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                resp.raise_for_status()
-                text = (await resp.text()).strip()
-                return text if text else "[Document contained no extractable text]"
-        except Exception as e:
-            return f"[Document extraction failed: {e}]"
-
-    # -----------------------------------------------------------------------
-    # Wayback Machine (archive.org) fallback
-    # -----------------------------------------------------------------------
-    async def _fetch_from_wayback(
-        self, session: aiohttp.ClientSession, url: str
-    ) -> Optional[Tuple[str, str]]:
-        """Recover readable text for `url` from the Internet Archive, or None.
-
-        A last resort when the live page (even after a FlareSolverr render) is
-        blocked or yields no readable text: a prior snapshot may have captured
-        text the live SPA now hides behind JS, or the page may since have
-        changed/disappeared. Returns ``(text, YYYY-MM-DD)`` for the closest
-        available 200 snapshot, or ``None``. Best-effort — any error returns
-        ``None`` since this only runs after the live attempts already failed.
-
-        The snapshot is requested in ``id_`` (identity) mode, which returns the
-        original archived HTML without the Wayback toolbar/URL-rewriting, so the
-        existing text extraction handles it like a live page.
-        """
-        now = time.strftime("%Y%m%d%H%M%S", time.gmtime())
-        try:
-            async with session.get(
-                WAYBACK_AVAILABILITY_API,
-                params={"url": url, "timestamp": now},
-                timeout=aiohttp.ClientTimeout(total=self.valves.PAGE_FETCH_TIMEOUT),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json(content_type=None)
-        except Exception as e:
-            log.debug(f"Wayback availability lookup failed for {url}: {e}")
-            return None
-
-        snap = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
-        ts = snap.get("timestamp") or ""
-        # Accept only an available snapshot that was a 200 capture; some omit
-        # `status`, which we tolerate.
-        if not snap.get("available") or not ts:
-            return None
-        if str(snap.get("status") or "200") != "200":
-            return None
-
-        snapshot_url = f"https://web.archive.org/web/{ts}id_/{url}"
-        try:
-            status, _headers, body, ct = await self._http_get(session, snapshot_url)
-            if status != 200:
-                return None
-            # Same document-vs-text branching as the live fetch: a snapshot can be
-            # an archived PDF/Office doc, mislabelled bytes, or a non-UTF-8 page.
-            if self._is_tika_document(ct, url) or _sniff_document_bytes(body):
-                text = await self._extract_document(session, body)
-            else:
-                text = self._html_to_text(_decode_body(body, ct))
-        except Exception as e:
-            log.debug(f"Wayback snapshot fetch failed for {snapshot_url}: {e}")
-            return None
-
-        if self._is_contentless(text):
-            return None
-        date = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 and ts[:8].isdigit() else ts
-        return text, date
-
-    # -----------------------------------------------------------------------
-    # YouTube transcript handling (optional dependency)
-    # -----------------------------------------------------------------------
-    @staticmethod
-    def _extract_video_id(url_or_id: str) -> str:
-        """Extract an 11-char YouTube video ID from a URL, or pass a bare ID through."""
-        s = (url_or_id or "").strip()
-        if not s:
-            raise ValueError("No URL or video ID provided.")
-        if _VIDEO_ID_RE.match(s):
-            return s
-        if not s.startswith(("http://", "https://")):
-            s = "https://" + s
-        parsed = urlparse(s)
-        host = (parsed.hostname or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        path = parsed.path or ""
-        if host == "youtu.be":
-            candidate = path.lstrip("/").split("/")[0]
-            if _VIDEO_ID_RE.match(candidate):
-                return candidate
-        if host.endswith("youtube.com") or host == "youtube-nocookie.com":
-            qs = parse_qs(parsed.query)
-            if qs.get("v"):
-                candidate = qs["v"][0]
-                if _VIDEO_ID_RE.match(candidate):
-                    return candidate
-            m = re.match(r"^/(?:shorts|embed|live|v)/([A-Za-z0-9_-]{11})", path)
-            if m:
-                return m.group(1)
-        raise ValueError(f"Could not extract a YouTube video ID from: {url_or_id!r}")
-
-    @classmethod
-    def _is_youtube_video_url(cls, url: str) -> bool:
-        """True only for a YouTube URL we can pull a video ID out of (watch,
-        youtu.be, /shorts/, /embed/, /live/) — not channels/playlists/home."""
-        s = (url or "").strip()
-        if not s.startswith(("http://", "https://")):
-            return False
-        try:
-            cls._extract_video_id(s)
-            return True
-        except ValueError:
-            return False
-
-    async def _fetch_youtube_transcript(self, url: str) -> str:
-        """Return a YouTube video's transcript as plain text, or "" on any failure.
-
-        Uses the optional `youtube-transcript-api` (>= 1.0); the blocking call is
-        offloaded to a thread. Empty string on no captions, a blocked IP, an
-        unavailable video, etc., so the caller falls back to a normal HTML fetch.
-        """
-        if not _YT_AVAILABLE:
-            return ""
-        try:
-            video_id = self._extract_video_id(url)
-        except ValueError:
-            return ""
-
-        def _work() -> str:
-            snippets = list(YouTubeTranscriptApi().fetch(video_id))
-            lines = [
-                (snip.text or "").replace("\n", " ").strip() for snip in snippets
-            ]
-            body = " ".join(ln for ln in lines if ln)
-            return f"YouTube transcript ({video_id}): {body}" if body else ""
-
-        try:
-            return await asyncio.to_thread(_work)
-        except Exception as e:
-            log.debug(f"YouTube transcript failed for {url}: {e}")
-            return ""
-
-    # -----------------------------------------------------------------------
-    # SearXNG
-    # -----------------------------------------------------------------------
-    async def _search(
-        self,
-        session: aiohttp.ClientSession,
-        query: str,
-        time_range: str = "",
-    ) -> List[Dict[str, str]]:
-        params: Dict[str, Any] = {
-            "q": query,
-            "format": "json",
-            "number_of_results": self.valves.SEARCH_RESULTS_PER_QUERY,
-        }
-        if self.valves.SEARCH_ENGINES:
-            params["engines"] = self.valves.SEARCH_ENGINES
-        # Recency filter (improvement #9): the plan's hint, else the valve.
-        tr = (time_range or self.valves.SEARCH_TIME_RANGE or "").strip().lower()
-        if tr in ("day", "week", "month", "year"):
-            params["time_range"] = tr
-        try:
-            async with session.get(
-                f"{self.valves.SEARXNG_URL.rstrip('/')}/search",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    out: List[Dict[str, str]] = []
-                    for r in data.get("results", []):
-                        # SearXNG exposes a publish date inconsistently as
-                        # "publishedDate" or "pubdate" depending on the engine.
-                        published = r.get("publishedDate") or r.get("pubdate")
-                        out.append(
-                            {
-                                "title": r.get("title", ""),
-                                "url": r.get("url", ""),
-                                "snippet": r.get("content", ""),
-                                "published_date": published,
-                            }
-                        )
-                    return out
-                log.warning(f"SearXNG {resp.status} for: {query}")
-        except Exception as e:
-            log.error(f"SearXNG error: {e}")
-        return []
-
-    # -----------------------------------------------------------------------
     # Phase 1 — research plan
     # -----------------------------------------------------------------------
     async def _generate_plan(
@@ -1908,7 +1074,7 @@ class Pipe:
         query: str,
         request: Any,
         user: Any,
-        session: aiohttp.ClientSession,
+        tools: ResearchTools,
         emitter: Optional[Callable],
     ) -> Tuple[str, List[str], Dict]:
         await self._emit_status(emitter, "🔍 Exploratory searches…")
@@ -1919,10 +1085,10 @@ class Pipe:
             exploratory.append(" ".join(words[:4]) + " overview")
         exploratory.append(query + " recent developments")
 
-        # Run the exploratory searches concurrently — they're independent, so
-        # firing them together pays one SearXNG round-trip instead of three.
+        # Run the exploratory searches concurrently — they're independent (the
+        # MCP server paces its Brave requests itself).
         searched = await asyncio.gather(
-            *[self._search(session, eq) for eq in exploratory[:3]]
+            *[tools.search(eq) for eq in exploratory[:3]]
         )
         snippets: List[str] = []
         for hits in searched:
@@ -2053,7 +1219,7 @@ Guidelines:
         plan: Dict,
         request: Any,
         user: Any,
-        session: aiohttp.ClientSession,
+        tools: ResearchTools,
         emitter: Optional[Callable],
     ) -> Tuple[List[Dict[str, str]], List[str]]:
         collected: List[Dict[str, Any]] = []
@@ -2074,7 +1240,7 @@ Guidelines:
 
         async def fetch(u: str) -> Dict[str, Any]:
             async with sem:
-                return await self._fetch_page(session, u)
+                return await tools.fetch(u)
 
         cycle = 0
         while cycle < self.valves.MAX_RESEARCH_CYCLES:
@@ -2110,9 +1276,9 @@ Guidelines:
 
             # --- Search (#9 recency, normalized de-dup) ---
             # Run this cycle's queries concurrently rather than one-after-another;
-            # each is an independent SearXNG round-trip. De-dup is applied serially
-            # over the gathered results, in batch order, so the kept set is
-            # identical to the old sequential version.
+            # each is an independent search_web call. De-dup is applied serially
+            # over the gathered results, in batch order, so the kept set doesn't
+            # depend on which search finished first.
             await self._emit_status(
                 emitter,
                 f"🔍 Searching {len(batch)} queries: "
@@ -2120,7 +1286,7 @@ Guidelines:
             )
             searched = await asyncio.gather(
                 *[
-                    self._search(session, w["query"], time_range=recency)
+                    tools.search(w["query"], time_range=recency)
                     for w in batch
                 ]
             )
@@ -2140,23 +1306,36 @@ Guidelines:
                     break
                 continue
 
-            # --- Fetch + relevance-extract (#1) ---
-            cap = self.valves.MAX_CONCURRENT_FETCHES * 2
-            batch_results = results[:cap]
-            await self._emit_status(emitter, f"📄 Fetching {len(batch_results)} pages…")
+            # --- Read + relevance-extract (#1) ---
+            # The first MAX_PAGE_FETCHES_PER_CYCLE results are read in full with
+            # fetch_page; the rest keep their search_web excerpts (Brave already
+            # extracted the query-relevant passages), so no result is dropped.
+            read_cap = max(0, self.valves.MAX_PAGE_FETCHES_PER_CYCLE)
+            to_read = results[:read_cap]
+            excerpt_only = len(results) - len(to_read)
+            await self._emit_status(
+                emitter,
+                f"📄 Reading {len(to_read)} pages"
+                + (f" (+{excerpt_only} from search excerpts)" if excerpt_only else "")
+                + "…",
+            )
             fetched = await asyncio.gather(
-                *[fetch(r["url"]) for _, r in batch_results],
+                *[fetch(r["url"]) for _, r in to_read],
                 return_exceptions=True,
             )
 
             new = 0
             cycle_start = len(collected)  # index of this cycle's first new passage
             hop_pool: List[Tuple[Dict, List[Tuple[str, str]]]] = []
-            valid = [
-                (w, r, page)
-                for (w, r), page in zip(batch_results, fetched)
-                if not isinstance(page, Exception) and page
-            ]
+            valid: List[Tuple[Dict, Dict, Dict]] = []
+            for i, (w, r) in enumerate(results):
+                page = fetched[i] if i < len(fetched) else None
+                if isinstance(page, BaseException) or not page:
+                    page = None
+                elif page.get("url"):
+                    # fetch_page may land on a redirect target; don't re-fetch it.
+                    seen_urls.add(_dedup_key(page["url"]))
+                valid.append((w, r, self._source_page(r, page)))
             # Relevance-extract the whole batch concurrently — with embeddings on,
             # each extraction is a network round-trip, so overlapping them turns N
             # serial calls into one. The append (`_record`) is then done serially
@@ -2232,7 +1411,11 @@ Guidelines:
                     for (w, href, page), (passages, score) in zip(
                         valid_hops, extracted
                     ):
-                        link_r = {"title": "", "url": page.get("url", href), "published_date": None}
+                        link_r = {
+                            "title": page.get("title") or "",
+                            "url": page.get("url") or href,
+                            "published_date": None,
+                        }
                         if self._record(
                             collected, source_urls, w, link_r, page, passages, score,
                             depth=1,
@@ -2294,12 +1477,6 @@ Guidelines:
                         f"{cycle} cycles",
                     )
                     break
-
-            if (
-                self.valves.CYCLE_DELAY_SECONDS > 0
-                and cycle < self.valves.MAX_RESEARCH_CYCLES
-            ):
-                await asyncio.sleep(self.valves.CYCLE_DELAY_SECONDS)
 
         return collected, source_urls
 
@@ -2497,6 +1674,27 @@ Guidelines:
                 )
         return None
 
+    # A fetched page with fewer words than this is treated as unread (an empty
+    # shell or a stub); the result's search excerpts are used instead.
+    _MIN_PAGE_WORDS = 30
+
+    @classmethod
+    def _source_page(cls, result: Dict, page: Optional[Dict]) -> Dict[str, Any]:
+        """Pick the text a search result contributes: the fetched page when it
+        has real content, else the result's search_web excerpts (kind
+        ``"excerpt"``). Keeps the page's links either way for multi-hop."""
+        if page and len((page.get("text") or "").split()) >= cls._MIN_PAGE_WORDS:
+            return page
+        page = page or {}
+        snippet = result.get("snippet") or ""
+        return {
+            "url": page.get("url") or result.get("url"),
+            "title": page.get("title") or "",
+            "text": snippet or page.get("text") or "",
+            "links": page.get("links") or [],
+            "kind": "excerpt" if snippet else page.get("kind", "failed"),
+        }
+
     def _record(
         self,
         collected: List[Dict],
@@ -2525,7 +1723,7 @@ Guidelines:
         collected.append(
             {
                 "url": url,
-                "title": result.get("title") or url,
+                "title": result.get("title") or page.get("title") or url,
                 "content": passages,
                 "section": work_item["section"],
                 "query": work_item["query"],
@@ -3065,6 +2263,149 @@ You may reference the existing [n] citation numbers that appear in the sections.
         return "\n".join(p)
 
     # -----------------------------------------------------------------------
+    # MCP tool resolution
+    # -----------------------------------------------------------------------
+    async def _resolve_tools(
+        self,
+        registry: Any,
+        request: Any,
+        user: Any,
+        metadata: Optional[dict],
+        event_call: Optional[Callable],
+    ) -> Tuple[Optional[ResearchTools], Any]:
+        """Locate search_web + fetch_page for this run.
+
+        Prefers the callables Open WebUI already resolved for the chat
+        (``__tools__``, present when the MCP server is enabled on the chat or
+        attached to the model). Otherwise connects directly through Open WebUI's
+        configured MCP connections — honouring their auth, access control, and
+        tool filters via ``connect_mcp_server`` — so the pipe works without the
+        user toggling the tool on every chat.
+
+        Returns ``(tools, owned_client)``; `owned_client` is non-None only when
+        the pipe opened the connection itself and must disconnect it (in this
+        same task) when the run ends. ``(None, None)`` when no server qualifies.
+        """
+        wanted = (self.valves.MCP_SERVER_ID or "").strip()
+        settings = dict(
+            timeout=float(max(0, self.valves.TOOL_CALL_TIMEOUT)),
+            num_results=max(0, self.valves.SEARCH_RESULTS_PER_QUERY),
+            default_time_range=(self.valves.SEARCH_TIME_RANGE or "").strip(),
+        )
+
+        found = _tools_from_registry(registry, wanted)
+        if found:
+            server_id, fns = found
+
+            async def invoke_registry(tool: str, args: Dict[str, Any]) -> Any:
+                return await fns[tool](**args)
+
+            log.info("Using MCP server %r from the chat's tools", server_id)
+            return ResearchTools(server_id, invoke_registry, **settings), None
+
+        server_id, client = await self._connect_mcp(
+            wanted, request, user, metadata, event_call
+        )
+        if client is None:
+            return None, None
+
+        async def invoke_client(tool: str, args: Dict[str, Any]) -> Any:
+            return await client.call_tool(tool, function_args=args)
+
+        log.info("Connected to MCP server %r directly", server_id)
+        return ResearchTools(server_id, invoke_client, **settings), client
+
+    async def _connect_mcp(
+        self,
+        wanted: str,
+        request: Any,
+        user: Any,
+        metadata: Optional[dict],
+        event_call: Optional[Callable],
+    ) -> Tuple[str, Any]:
+        """Open a connection to the MCP server that provides both tools.
+
+        Tries `wanted` when set, else every enabled MCP tool-server connection
+        in order, keeping the first whose (filtered) tool list has both
+        search_web and fetch_page. Returns ``(server_id, client)`` or
+        ``("", None)``. Runs sequentially in the caller's task: Open WebUI's MCP
+        client must be closed in the task that opened it.
+        """
+        if request is None or user is None:
+            return "", None
+        try:
+            from open_webui.utils.tools import connect_mcp_server
+        except ImportError as e:
+            log.warning("Open WebUI MCP support unavailable: %s", e)
+            return "", None
+
+        if wanted:
+            server_ids = [wanted]
+        else:
+            try:
+                connections = await Config.get("tool_server.connections", []) or []
+            except Exception as e:
+                log.warning("Could not read tool server connections: %s", e)
+                connections = []
+            server_ids = [
+                (c.get("info") or {}).get("id")
+                for c in connections
+                if isinstance(c, dict)
+                and c.get("type") == "mcp"
+                and (c.get("config") or {}).get("enable")
+            ]
+
+        extra_params = {"__metadata__": metadata or {}, "__event_call__": event_call}
+        for server_id in server_ids:
+            if not server_id:
+                continue
+            try:
+                result = await connect_mcp_server(request, server_id, user, extra_params)
+            except Exception as e:
+                log.warning("Could not connect to MCP server %r: %s", server_id, e)
+                continue
+            if result is None:
+                continue
+            client, specs = result
+            names = {s.get("name") for s in specs or [] if isinstance(s, dict)}
+            if all(t in names for t in _REQUIRED_TOOLS):
+                return server_id, client
+            await client.disconnect()
+        return "", None
+
+    # -----------------------------------------------------------------------
+    # Follow-up questions about a finished report
+    # -----------------------------------------------------------------------
+    async def _answer_followup(
+        self, messages: List[Dict], request: Any, user: Any
+    ) -> str:
+        """Answer a message sent after a report was delivered in this chat.
+
+        The conversation (report included, done-markers stripped) goes to
+        RESEARCH_MODEL with an instruction to answer from the report's sources,
+        rather than starting a second research run or returning an empty reply.
+        """
+        convo: List[Dict] = []
+        for m in messages:
+            content = m.get("content")
+            if m.get("role") == "assistant" and isinstance(content, str):
+                m = {**m, "content": content.replace(_DONE_MARKER, "")}
+            convo.append(m)
+        system = {
+            "role": "system",
+            "content": (
+                "Earlier in this conversation you delivered a deep-research report "
+                "with numbered [n] sources. Answer the user's follow-up using that "
+                "report and its sources, citing [n] where relevant. If the answer "
+                "isn't supported by the report, say so plainly and suggest starting "
+                "a new Deep Research chat for that question."
+            ),
+        }
+        return await self._llm_call(
+            [system, *convo], request, user, temperature=0.3, max_tokens=4096
+        )
+
+    # -----------------------------------------------------------------------
     # Main entry point
     # -----------------------------------------------------------------------
     async def pipe(
@@ -3076,6 +2417,7 @@ You may reference the existing [n] citation numbers that appear in the sections.
         __request__: Optional[Any] = None,
         __task__: Optional[str] = None,
         __metadata__: Optional[dict] = None,
+        __tools__: Optional[dict] = None,
     ) -> str:
         """
         Orchestrate the deep-research workflow.
@@ -3084,18 +2426,18 @@ You may reference the existing [n] citation numbers that appear in the sections.
         response lifecycle. Replace events are used only for live progress.
         """
         # ==============================================================
-        # TASK GUARD: Open WebUI re-invokes the pipe for background
-        # tasks like title_generation, tags_generation, emoji_generation
-        # and autocomplete_generation AFTER the main response.
-        # These must NOT trigger a full research run.  Instead, forward
-        # the request to the underlying model for a quick answer.
+        # TASK GUARD: Open WebUI invokes the selected model for background
+        # tasks like title_generation, tags_generation, follow_up_generation
+        # and autocomplete_generation. These must NOT trigger a full
+        # research run. Instead, forward the request to the underlying
+        # model for a quick answer.
         # ==============================================================
         if __task__:
             log.info(f"Task call received: {__task__} — forwarding to model")
             task_model = (self.valves.RESEARCH_MODEL or "").strip()
             task_messages = body.get("messages", [])
             if not task_model or task_model == body.get("model"):
-                # A pipe has no implicit "default" model ID in Open WebUI 0.11.
+                # A pipe has no implicit "default" model ID in Open WebUI.
                 # Returning a stable label is preferable to recursively invoking
                 # this pipe or making a request for a nonexistent model.
                 return "Deep Research"
@@ -3132,223 +2474,257 @@ You may reference the existing [n] citation numbers that appear in the sections.
                 "Deep Research pipe itself."
             )
 
-        # ==============================================================
-        # RE-ENTRY GUARD: if the conversation already has a completed
-        # report, don't run again.
-        # ==============================================================
-        all_messages = body.get("messages", [])
-        for msg in all_messages:
-            if msg.get("role") == "assistant":
-                content = msg.get("content")
-                if isinstance(content, str) and _DONE_MARKER in content:
-                    log.info("Re-entry guard: report exists, skipping")
-                    return ""
-
-        # Open WebUI 0.11 preserves the user's original prompt in metadata.
-        # Prefer it because body.messages may contain a citation/RAG wrapper
-        # when files or knowledge sources are attached.
-        user_query = str((__metadata__ or {}).get("user_prompt") or "").strip()
-        if not user_query:
-            _, messages = pop_system_message(all_messages)
-            user_query = get_last_user_message(messages)
-        if not user_query:
-            return "Please provide a research topic or question."
-
         user_obj = None
         if __user__:
             user_obj = await Users.get_user_by_id(__user__["id"])
 
+        # ==============================================================
+        # FOLLOW-UP: the conversation already has a completed report, so
+        # answer the new message about it instead of researching again.
+        # ==============================================================
+        all_messages = body.get("messages", [])
+        if any(
+            msg.get("role") == "assistant"
+            and isinstance(msg.get("content"), str)
+            and _DONE_MARKER in msg["content"]
+            for msg in all_messages
+        ):
+            log.info("Report already delivered in this chat; answering follow-up")
+            try:
+                return await self._answer_followup(all_messages, __request__, user_obj)
+            except Exception as e:
+                log.error(f"Follow-up answer failed: {e}")
+                return f"Follow-up failed: {e}"
+
+        # Open WebUI 0.12 records the user's prompt (before file/knowledge
+        # context is injected into the messages) as `base_user_prompt`. Prefer
+        # it so an attached file's RAG wrapper doesn't become the research
+        # query.
+        meta = __metadata__ or {}
+        user_query = str(
+            meta.get("base_user_prompt") or meta.get("user_prompt") or ""
+        ).strip()
+        if not user_query:
+            _, messages = pop_system_message(all_messages)
+            user_query = (get_last_user_message(messages) or "").strip()
+        if not user_query:
+            return "Please provide a research topic or question."
+
+        tools, owned_client = await self._resolve_tools(
+            __tools__, __request__, user_obj, __metadata__, __event_call__
+        )
+        if tools is None:
+            wanted = (self.valves.MCP_SERVER_ID or "").strip()
+            return (
+                "Deep Research needs the MCP server's search_web and fetch_page "
+                "tools, but "
+                + (
+                    f"the MCP server {wanted!r} (MCP_SERVER_ID) is unavailable or "
+                    "doesn't expose both."
+                    if wanted
+                    else "no enabled MCP tool server exposing both was found."
+                )
+                + " Add it under Admin Settings → External Tools (type MCP, "
+                "Streamable HTTP), or set MCP_SERVER_ID in this function's valves."
+            )
+
         try:
-            async with aiohttp.ClientSession() as session:
+            # ======================================================
+            # PHASE 1 — plan
+            # ======================================================
+            await self._emit_status(__event_emitter__, "🚀 Starting deep research…")
+            plan_text, _, plan = await self._generate_plan(
+                user_query,
+                __request__,
+                user_obj,
+                tools,
+                __event_emitter__,
+            )
 
-                # ======================================================
-                # PHASE 1 — plan
-                # ======================================================
-                await self._emit_status(__event_emitter__, "🚀 Starting deep research…")
-                plan_text, _, plan = await self._generate_plan(
-                    user_query,
-                    __request__,
-                    user_obj,
-                    session,
-                    __event_emitter__,
-                )
-
-                # ======================================================
-                # PLAN CONFIRMATION (only user interaction point)
-                # ======================================================
-                if not self.valves.SKIP_PLAN_CONFIRMATION and __event_call__:
-                    await self._emit_status(
-                        __event_emitter__,
-                        "⏳ Waiting for plan confirmation…",
-                    )
-                    try:
-                        confirmation = await __event_call__(
-                            {
-                                "type": "input",
-                                "data": {
-                                    "title": "📋 Research Plan Review",
-                                    "message": (
-                                        f"{plan_text}\n\n"
-                                        "Type **ok** or **yes** to proceed, "
-                                        "or describe changes you'd like."
-                                    ),
-                                    "placeholder": (
-                                        "ok / yes / your modifications…"
-                                    ),
-                                },
-                            }
-                        )
-                    except Exception as exc:
-                        # WEBSOCKET_EVENT_CALLER_TIMEOUT raises in Open WebUI
-                        # 0.11. Continue with the generated plan rather than
-                        # discarding an otherwise valid research run.
-                        log.warning("Plan confirmation unavailable: %s", exc)
-                        confirmation = None
-
-                    resp = ""
-                    if isinstance(confirmation, dict):
-                        if confirmation.get("error"):
-                            log.warning(
-                                "Plan confirmation interrupted: %s",
-                                confirmation["error"],
-                            )
-                        else:
-                            resp = str(
-                                confirmation.get("value", "")
-                            ).strip().lower()
-                    elif isinstance(confirmation, str):
-                        resp = confirmation.strip().lower()
-
-                    if resp not in {
-                        "ok",
-                        "yes",
-                        "y",
-                        "continue",
-                        "proceed",
-                        "go",
-                        "looks good",
-                        "lgtm",
-                        "approve",
-                        "confirmed",
-                        "",
-                    }:
-                        await self._emit_status(
-                            __event_emitter__,
-                            "🔄 Adjusting plan…",
-                        )
-                        mod = await self._llm_call(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "Modify this research plan.\n\n"
-                                        f"Query: {user_query}\n"
-                                        f"Plan: {json.dumps(plan)}\n"
-                                        f"Changes: {resp}\n\n"
-                                        "Return updated JSON only."
-                                    ),
-                                }
-                            ],
-                            __request__,
-                            user_obj,
-                            temperature=0.4,
-                        )
-                        modified = _extract_json(mod)
-                        if isinstance(modified, dict):
-                            plan = modified
-                        else:
-                            log.warning("Modified plan parse failed")
-
-                # ======================================================
-                # Write initial progress into message body
-                # ======================================================
-                await self._emit_replace(
-                    __event_emitter__,
-                    self._progress_msg("Starting research…", plan=plan),
-                )
-
-                # ======================================================
-                # PHASE 2 — research loop (autonomous, no user prompts)
-                # ======================================================
-                await self._emit_status(__event_emitter__, "🔬 Researching…")
-                collected, source_urls = await self._research_loop(
-                    user_query,
-                    plan,
-                    __request__,
-                    user_obj,
-                    session,
-                    __event_emitter__,
-                )
-
-                if not collected:
-                    msg = (
-                        "Unable to gather sufficient research data. "
-                        "Check SearXNG availability or refine the query."
-                    )
-                    await self._emit_replace(__event_emitter__, "")
-                    await self._emit_status(
-                        __event_emitter__,
-                        "⚠️ No data collected",
-                        done=True,
-                    )
-                    return msg + _DONE_MARKER
-
-                # Update progress
-                await self._emit_replace(
-                    __event_emitter__,
-                    self._progress_msg(
-                        "Writing report…",
-                        plan=plan,
-                        cycle=self.valves.MAX_RESEARCH_CYCLES,
-                        max_cycles=self.valves.MAX_RESEARCH_CYCLES,
-                        sources=len(source_urls),
-                        snippets=len(collected),
-                        urls=source_urls,
-                    ),
-                )
-
-                # ======================================================
-                # PHASE 3 — report
-                # ======================================================
-                report = await self._generate_report(
-                    user_query,
-                    plan,
-                    collected,
-                    source_urls,
-                    __request__,
-                    user_obj,
-                    __event_emitter__,
-                )
-
-                # Append the done-marker so the re-entry guard works
-                report_with_marker = report + _DONE_MARKER
-
-                # Clear any "in-progress" content from the message body so
-                # the returned report doesn't get appended after it.
-                await self._emit_replace(__event_emitter__, "")
-
-                # Citations
-                for s in collected:
-                    if s["url"] and s["url"] != "compressed_summary":
-                        await self._emit_citation(
-                            __event_emitter__,
-                            s["url"],
-                            s["title"],
-                            s["content"][:300],
-                        )
-
+            # ======================================================
+            # PLAN CONFIRMATION (only user interaction point)
+            # ======================================================
+            if not self.valves.SKIP_PLAN_CONFIRMATION and __event_call__:
                 await self._emit_status(
                     __event_emitter__,
-                    f"✅ Done — {len(source_urls)} sources, "
-                    f"{len(plan.get('sections',[]))} sections",
+                    "⏳ Waiting for plan confirmation…",
+                )
+                try:
+                    confirmation = await __event_call__(
+                        {
+                            "type": "input",
+                            "data": {
+                                "title": "📋 Research Plan Review",
+                                "message": (
+                                    f"{plan_text}\n\n"
+                                    "Type **ok** or **yes** to proceed, "
+                                    "or describe changes you'd like."
+                                ),
+                                "placeholder": (
+                                    "ok / yes / your modifications…"
+                                ),
+                            },
+                        }
+                    )
+                except Exception as exc:
+                    # Continue with the generated plan rather than discarding an
+                    # otherwise valid research run.
+                    log.warning("Plan confirmation unavailable: %s", exc)
+                    confirmation = None
+
+                # The dialog's Cancel button answers False: stop here.
+                if confirmation is False:
+                    await self._emit_status(
+                        __event_emitter__, "🛑 Research cancelled", done=True
+                    )
+                    return "Research cancelled at the plan review step."
+
+                resp = ""
+                if isinstance(confirmation, dict):
+                    # Timeouts and closed tabs come back as {"error": ...};
+                    # proceed with the generated plan.
+                    if confirmation.get("error"):
+                        log.warning(
+                            "Plan confirmation interrupted: %s",
+                            confirmation["error"],
+                        )
+                    else:
+                        resp = str(
+                            confirmation.get("value", "")
+                        ).strip().lower()
+                elif isinstance(confirmation, str):
+                    resp = confirmation.strip().lower()
+
+                if resp not in {
+                    "ok",
+                    "yes",
+                    "y",
+                    "continue",
+                    "proceed",
+                    "go",
+                    "looks good",
+                    "lgtm",
+                    "approve",
+                    "confirmed",
+                    "",
+                }:
+                    await self._emit_status(
+                        __event_emitter__,
+                        "🔄 Adjusting plan…",
+                    )
+                    mod = await self._llm_call(
+                        [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Modify this research plan.\n\n"
+                                    f"Query: {user_query}\n"
+                                    f"Plan: {json.dumps(plan)}\n"
+                                    f"Changes: {resp}\n\n"
+                                    "Return updated JSON only."
+                                ),
+                            }
+                        ],
+                        __request__,
+                        user_obj,
+                        temperature=0.4,
+                    )
+                    modified = _extract_json(mod)
+                    if isinstance(modified, dict):
+                        plan = modified
+                    else:
+                        log.warning("Modified plan parse failed")
+
+            # ======================================================
+            # Write initial progress into message body
+            # ======================================================
+            await self._emit_replace(
+                __event_emitter__,
+                self._progress_msg("Starting research…", plan=plan),
+            )
+
+            # ======================================================
+            # PHASE 2 — research loop (autonomous, no user prompts)
+            # ======================================================
+            await self._emit_status(__event_emitter__, "🔬 Researching…")
+            collected, source_urls = await self._research_loop(
+                user_query,
+                plan,
+                __request__,
+                user_obj,
+                tools,
+                __event_emitter__,
+            )
+
+            if not collected:
+                msg = (
+                    "Unable to gather sufficient research data. Check that the "
+                    f"MCP server {tools.server_id!r} can search, or refine the "
+                    "query."
+                )
+                if tools.last_error:
+                    msg += f"\n\nLast tool error: {tools.last_error}"
+                await self._emit_replace(__event_emitter__, "")
+                await self._emit_status(
+                    __event_emitter__,
+                    "⚠️ No data collected",
                     done=True,
                 )
+                return msg
 
-                # Return the report as the final message content.
-                # The _DONE_MARKER prevents the re-entry guard at the top
-                # of pipe() from re-running research on any subsequent
-                # invocation in the same conversation.
-                return report_with_marker
+            # Update progress
+            await self._emit_replace(
+                __event_emitter__,
+                self._progress_msg(
+                    "Writing report…",
+                    plan=plan,
+                    cycle=self.valves.MAX_RESEARCH_CYCLES,
+                    max_cycles=self.valves.MAX_RESEARCH_CYCLES,
+                    sources=len(source_urls),
+                    snippets=len(collected),
+                    urls=source_urls,
+                ),
+            )
+
+            # ======================================================
+            # PHASE 3 — report
+            # ======================================================
+            report = await self._generate_report(
+                user_query,
+                plan,
+                collected,
+                source_urls,
+                __request__,
+                user_obj,
+                __event_emitter__,
+            )
+
+            # Append the done-marker so later messages in this chat are
+            # answered as follow-ups instead of re-running research.
+            report_with_marker = report + _DONE_MARKER
+
+            # Clear any "in-progress" content from the message body so
+            # the returned report doesn't get appended after it.
+            await self._emit_replace(__event_emitter__, "")
+
+            # Citations
+            for s in collected:
+                if s["url"] and s["url"] != "compressed_summary":
+                    await self._emit_citation(
+                        __event_emitter__,
+                        s["url"],
+                        s["title"],
+                        s["content"][:300],
+                    )
+
+            await self._emit_status(
+                __event_emitter__,
+                f"✅ Done — {len(source_urls)} sources, "
+                f"{len(plan.get('sections',[]))} sections",
+                done=True,
+            )
+
+            return report_with_marker
 
         except Exception as e:
             log.error(f"Deep Research error: {e}", exc_info=True)
@@ -3358,3 +2734,8 @@ You may reference the existing [n] citation numbers that appear in the sections.
                 done=True,
             )
             return f"Research error: {e}"
+        finally:
+            # A connection the pipe opened itself is closed here, in the task
+            # that opened it (MCP sessions can't be closed from another task).
+            if owned_client is not None:
+                await owned_client.disconnect()
