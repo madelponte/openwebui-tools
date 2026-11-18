@@ -1,7 +1,7 @@
 """
 title: Deep Research
 author: mdelponte
-version: 3.0.0
+version: 3.0.1
 license: MIT
 description: >
     A deep research pipe that takes a user query, generates a research plan,
@@ -44,10 +44,6 @@ from typing import (
 
 from pydantic import BaseModel, Field
 
-from open_webui.config import (
-    RAG_EMBEDDING_CONTENT_PREFIX,
-    RAG_EMBEDDING_QUERY_PREFIX,
-)
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.misc import pop_system_message, get_last_user_message
 from open_webui.models.config import Config
@@ -116,9 +112,14 @@ def _parse_tool_result(result: Any) -> Dict[str, Any]:
 
     Open WebUI's ``MCPClient.call_tool`` returns the MCP content list
     (``[{"type": "text", "text": "<json>"}, ...]``) and raises on ``isError``.
-    This server's text block is the JSON payload (identical to its
-    structuredContent), so the first text block that parses to an object wins.
+    From 0.13.0, a tool that declares an MCP App UI returns an ``MCPAppResult``
+    instead, whose ``context`` holds that same list. This server's text block
+    is the JSON payload (identical to its structuredContent), so the first text
+    block that parses to an object wins.
     """
+    context = getattr(result, "context", None)
+    if isinstance(context, list):
+        result = context
     if isinstance(result, dict) and "type" not in result:
         return result
     items = result if isinstance(result, list) else [result]
@@ -754,8 +755,9 @@ class Pipe:
         MCP_SERVER_ID: str = Field(
             default="",
             description=(
-                "ID of the MCP tool server (Admin Settings → External Tools) "
-                "that provides search_web and fetch_page. Blank = auto-detect: "
+                "ID of the MCP tool server (Admin Settings → Integrations → "
+                "External Tool Servers) that provides search_web and "
+                "fetch_page. Blank = auto-detect: "
                 "use the server's tools when it is enabled for the chat, else "
                 "connect to the first enabled MCP connection that exposes both "
                 "tools."
@@ -1534,22 +1536,12 @@ Guidelines:
             return None
 
         # Prefix-aware models use different instructions for queries and stored
-        # content. Open WebUI 0.11 consistently applies these prefixes, so embed
-        # the query and page segments separately rather than mixing both roles in
+        # content. Open WebUI applies these prefixes consistently, so embed the
+        # query and page segments separately rather than mixing both roles in
         # one batch with prefix=None.
         query_vectors, segment_vectors = await asyncio.gather(
-            self._embed(
-                [query],
-                request,
-                user,
-                prefix=RAG_EMBEDDING_QUERY_PREFIX,
-            ),
-            self._embed(
-                segs,
-                request,
-                user,
-                prefix=RAG_EMBEDDING_CONTENT_PREFIX,
-            ),
+            self._embed([query], request, user, role="query"),
+            self._embed(segs, request, user, role="content"),
         )
         if (
             not query_vectors
@@ -1589,7 +1581,7 @@ Guidelines:
         request: Any,
         user: Any,
         *,
-        prefix: Optional[str] = None,
+        role: str,
     ) -> Optional[List[List[float]]]:
         """Embed `texts` via Open WebUI's configured embeddings endpoint.
 
@@ -1598,7 +1590,8 @@ Guidelines:
         caller then uses the lexical scorer. For the API-backed RAG engines
         (openai/ollama/azure_openai) the ``EMBEDDING_MODEL`` valve's model ID is
         used directly; for the local engine Open WebUI's already-built embedding
-        function (its configured model) is used.
+        function (its configured model) is used. `role` (``"query"`` or
+        ``"content"``) selects Open WebUI's matching embedding prefix.
         """
         if not self.valves.EMBEDDING_MODEL or request is None or not texts:
             return None
@@ -1606,6 +1599,7 @@ Guidelines:
             # Open WebUI 0.11 replaced request.app.state.config with the async,
             # per-key Config model. Read the current RAG connection settings in
             # one query, matching Open WebUI's own embedding setup.
+            prefix_key = f"rag.embedding_{role}_prefix"
             cfg = await Config.get_many(
                 "rag.embedding_engine",
                 "rag.openai.api_base_url",
@@ -1615,7 +1609,18 @@ Guidelines:
                 "rag.azure_openai.base_url",
                 "rag.azure_openai.api_key",
                 "rag.azure_openai.api_version",
+                prefix_key,
             )
+            if prefix_key in cfg:
+                # 0.12.5+: the prefixes are admin settings (Documents).
+                prefix = cfg[prefix_key]
+            else:
+                # 0.12.4 only reads them from environment variables.
+                from open_webui import config as owui_config
+
+                prefix = getattr(
+                    owui_config, f"RAG_EMBEDDING_{role.upper()}_PREFIX", None
+                )
             engine = (cfg.get("rag.embedding_engine") or "").lower()
             if engine in ("openai", "ollama", "azure_openai"):
                 from open_webui.retrieval.utils import generate_embeddings
@@ -2387,10 +2392,16 @@ You may reference the existing [n] citation numbers that appear in the sections.
         """
         convo: List[Dict] = []
         for m in messages:
-            content = m.get("content")
-            if m.get("role") == "assistant" and isinstance(content, str):
-                m = {**m, "content": content.replace(_DONE_MARKER, "")}
-            convo.append(m)
+            role, content = m.get("role"), m.get("content")
+            # With native function calling, Open WebUI 0.13.1+ adds hidden
+            # tool calls and results (memory recall, skill and knowledge
+            # lists) to the history. This request declares no tools, so keep
+            # only the conversation's text.
+            if role not in ("system", "user", "assistant") or not content:
+                continue
+            if role == "assistant" and isinstance(content, str):
+                content = content.replace(_DONE_MARKER, "")
+            convo.append({"role": role, "content": content})
         system = {
             "role": "system",
             "content": (
@@ -2524,8 +2535,9 @@ You may reference the existing [n] citation numbers that appear in the sections.
                     if wanted
                     else "no enabled MCP tool server exposing both was found."
                 )
-                + " Add it under Admin Settings → External Tools (type MCP, "
-                "Streamable HTTP), or set MCP_SERVER_ID in this function's valves."
+                + " Add it under Admin Settings → Integrations → External Tool "
+                "Servers (type MCP, Streamable HTTP), or set MCP_SERVER_ID in "
+                "this function's valves."
             )
 
         try:

@@ -7,10 +7,12 @@ A Workspace Tool that lets a model pause and ask the user for missing informatio
 - Open WebUI **0.11.0 or later**, with native function/tool calling and a live WebUI browser session. Ordinary API-only callers cannot answer interactive prompts.
 - **0.11.1+:** questions appear in the built-in inline panel above the chat input. Click an answer or type a custom response in **Other**. Open-ended questions show just the text entry.
 - **0.11.0:** uses the floating input dialog. Choices appear in a dropdown; selecting **Other (type your answer)** opens a second dialog for custom text.
+- **0.12.0+:** Open WebUI limits how long an inline question waits (see [Waiting and errors](#waiting-and-errors)). Questions sent while the chat isn't open in the browser are cancelled immediately.
+- **0.12.4+:** if the page reloads or the connection drops while a question is pending, Open WebUI sends it again when the chat reconnects within about 60 seconds.
 
 Third-party tools can use the inline panel: `__event_call__` with event type `request:user_input` reaches the same UI as the built-in `ask_user`, without invoking that tool's strict argument validation. This tool generates question IDs, headers, and option objects itself; the model only supplies a question and optional strings.
 
-Verified against upstream [0.11.1 event handling](https://github.com/open-webui/open-webui/blob/v0.11.1/src/lib/components/chat/Chat.svelte), [inline card](https://github.com/open-webui/open-webui/blob/v0.11.1/src/lib/components/chat/AskUserCard.svelte), and [0.11.3 built-in implementation](https://github.com/open-webui/open-webui/blob/v0.11.3/backend/open_webui/tools/builtin.py). This is a frontend event integration, not a guarantee that custom tools inherit every built-in feature: prompts require the original live session and are not restored after a page reload.
+Checked against the upstream [0.13.4 event handling](https://github.com/open-webui/open-webui/blob/v0.13.4/src/lib/components/chat/Chat.svelte), [inline card](https://github.com/open-webui/open-webui/blob/v0.13.4/src/lib/components/chat/AskUserCard.svelte), and [server event caller](https://github.com/open-webui/open-webui/blob/v0.13.4/backend/open_webui/socket/main.py). The request and answer formats have not changed since 0.11.1. This is a frontend event integration, not a guarantee that custom tools inherit every built-in feature: unlike the built-in `ask_user`, a pending question is not saved with the chat, so it is lost if the browser stays disconnected.
 
 ## Installation / update
 
@@ -50,13 +52,18 @@ Ask one question per call and call sequentially, not in parallel: WebUI's intera
 
 | Valve | Default | Behavior |
 | --- | --- | --- |
-| `UI_MODE` | `auto` | Detects the server version: inline on 0.11.1+, modal on older/unknown versions. `modal` forces the floating dialog; `inline` forces the modern panel for custom/backported builds. |
+| `UI_MODE` | `auto` | Detects the server version: inline on 0.11.1+, modal on older/unknown versions. `modal` forces the floating dialog, which has no time limit on 0.12+; `inline` forces the modern panel for custom/backported builds. |
 
 The browser and server should run matching versions. If prompts do not appear after an upgrade, refresh the browser and check `UI_MODE`. Do not force `inline` on an unsupported frontend: unknown events may wait without displaying anything. There is no automatic retry after a timeout or cancellation, which could otherwise cause duplicate prompts.
 
 ## Waiting and errors
 
-Like the original tool, prompts have no tool-imposed deadline. Administrators can configure Open WebUI's `WEBSOCKET_EVENT_CALLER_TIMEOUT` to bound the server wait. The tool handles timeout exceptions, disconnected-client error responses, and cancellation, and finishes progress statuses on handled failures. Failed status delivery does not discard a successful answer; raw backend exceptions are not exposed to the model.
+How long a question waits depends on the Open WebUI version and the UI:
+
+- **Inline panel on 0.12.0+:** Open WebUI allows inline questions between 1 and 4 minutes, and uses 2 minutes when a tool doesn't ask for a specific time. This tool asks for the 4-minute maximum. If users need longer to answer, set `UI_MODE` to `modal`.
+- **Inline panel on 0.11.x, and the floating dialog on every version:** no time limit is set by the tool or by Open WebUI.
+
+Administrators can set Open WebUI's `WEBSOCKET_EVENT_CALLER_TIMEOUT` to cap both. When a question times out, the model is told so and told not to assume an answer. The tool handles timeouts, disconnected-client error responses, and cancellation, and finishes progress statuses on handled failures. Failed status delivery does not discard a successful answer; raw backend exceptions are not exposed to the model.
 
 ## Offline validation
 

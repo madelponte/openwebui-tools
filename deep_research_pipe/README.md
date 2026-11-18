@@ -40,15 +40,15 @@ This phase runs fully autonomously; you just see status updates in the UI.
 
 ## Compatibility
 
-This version targets Open WebUI **0.12.4 or later**:
+This version targets Open WebUI **0.12.4 or later** and has been checked against the 0.13.4 source:
 
-- It receives MCP tools through the pipe's `__tools__` parameter and can open its own connection to a configured MCP tool server.
-- It reads the user's prompt from `base_user_prompt`.
-- It uses the current event, citation, and input-dialog payloads, and the async per-key configuration API for optional embeddings.
+- It receives MCP tools through the pipe's `__tools__` parameter and can open its own connection to a configured MCP tool server. It also reads the wrapped results that 0.13.0+ returns for MCP tools with an app UI.
+- It reads the user's prompt from `base_user_prompt`. Before answering a follow-up question, it removes the hidden tool messages that 0.13.1+ adds to the chat history under native function calling.
+- It uses the current event, citation, and input-dialog payloads, and the async per-key configuration API for optional embeddings. It uses the embedding prefixes set in **Admin Settings → Documents** (0.12.5+), or the `RAG_EMBEDDING_QUERY_PREFIX`/`RAG_EMBEDDING_CONTENT_PREFIX` environment variables on 0.12.4.
 
 ## Installation
 
-1. **Add the MCP server to Open WebUI.** Go to **Admin Settings → External Tools**, add a connection of type **MCP (Streamable HTTP)** pointing at `http://<host>:8000/mcp`, use Bearer auth with one of the server's `auth_tokens`, and give it an **ID** (for example `mcp`). Make sure the connection is enabled and its tool filter (if any) allows `search_web` and `fetch_page`.
+1. **Add the MCP server to Open WebUI.** Go to **Admin Settings → Integrations → External Tool Servers**, add a connection of type **MCP (Streamable HTTP)** pointing at `http://<host>:8000/mcp`, use Bearer auth with one of the server's `auth_tokens`, and give it an **ID** (for example `mcp`). Make sure the connection is enabled and its tool filter (if any) allows `search_web` and `fetch_page`.
 2. Go to **Admin Settings → Functions**, create a function, and paste the contents of `deep_research_pipe.py`.
 3. Save and enable the function.
 4. Configure the function valves (see below). You must set `RESEARCH_MODEL`. Set `MCP_SERVER_ID` to the connection's ID if you have more than one MCP server that exposes these tools.
@@ -127,5 +127,5 @@ Valves from earlier versions that no longer exist are ignored when the function 
 - **More thorough research:** Increase `MAX_RESEARCH_CYCLES` to 7–10, `QUERIES_PER_CYCLE` to 4–5, and `MIN_SOURCES_PER_SECTION` to 3–4. Raise `MAX_LINK_HOPS_PER_CYCLE` to follow more primary-source links.
 - **Faster / cheaper runs:** Lower `MAX_RESEARCH_CYCLES` to 2–3 and `MIN_SOURCES_PER_SECTION` to 1, set `MAX_PAGE_FETCHES_PER_CYCLE` to 0–3 (search excerpts are often enough), set `MAX_LINK_HOPS_PER_CYCLE` and `FOLLOWUP_QUERIES_PER_CYCLE` to 0, set `REPORT_MODE` to `single`, and set `SKIP_PLAN_CONFIRMATION` to `True`.
 - **Rate limiting:** The MCP server paces Brave requests itself (`web_search.brave_request_delay_seconds`). If source sites push back, lower `MAX_CONCURRENT_FETCHES`.
-- **"Needs the MCP server's search_web and fetch_page tools":** Check that the External Tools connection is enabled, that its tool filter allows both tools, and that the user has access to it. If you have several MCP connections, set `MCP_SERVER_ID`. The Open WebUI server log shows the connection error.
+- **"Needs the MCP server's search_web and fetch_page tools":** Check that the External Tool Servers connection is enabled, that its tool filter allows both tools, and that the user has access to it. If you have several MCP connections, set `MCP_SERVER_ID`. The Open WebUI server log shows the connection error.
 - **Page refresh during research:** The pipe writes a progress snapshot into the message body early on, so if you refresh mid-research you'll see a summary of what's been collected so far rather than a blank message. The final report replaces this snapshot when complete.

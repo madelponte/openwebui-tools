@@ -56,7 +56,8 @@ class ClarificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, label.strip())
         event = caller.call_args.args[0]
         self.assertEqual(event["type"], "request:user_input")
-        self.assertIsNone(event["data"]["timeout_ms"])
+        # Unknown server version: request the 0.12+ maximum.
+        self.assertEqual(event["data"]["timeout_ms"], 240_000)
         self.assertTrue(event["data"]["allow_other"])
         question = event["data"]["questions"][0]
         self.assertEqual(question["id"], "clarification")
@@ -166,6 +167,30 @@ class ClarificationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.startswith("Error:"))
                 self.assertEqual(caller.await_count, 1)
 
+    async def test_timeouts_are_reported_as_timeouts(self):
+        for mode in ("inline", "modal"):
+            self.tool.valves.UI_MODE = mode
+            for side_effect in (
+                [{"error": "Event call timed out. The browser tab may be inactive or closed."}],
+                asyncio.TimeoutError(),
+            ):
+                with self.subTest(mode=mode, side_effect=side_effect):
+                    emitter = AsyncMock()
+                    result = await self.tool.ask_clarifying_question(
+                        "Language?",
+                        choices=["Python"],
+                        __event_call__=AsyncMock(side_effect=side_effect),
+                        __event_emitter__=emitter,
+                    )
+                    self.assertEqual(result, f"Error: {PLUGIN._TIMEOUT_MESSAGE}")
+                    self.assertEqual(
+                        emitter.call_args.args[0]["data"],
+                        {"description": "Clarification request timed out.", "done": True},
+                    )
+        self.tool.valves.UI_MODE = "inline"
+        result, _ = await self.invoke({"error": "Client session disconnected."})
+        self.assertNotIn("timed out before", result)
+
     async def test_exceptions_are_safe_and_finish_status(self):
         secret = "https://user:secret@example.invalid/?token=private"
         for exc in (
@@ -252,6 +277,26 @@ class ClarificationTests(unittest.IsolatedAsyncioTestCase):
         self.tool.valves.UI_MODE = "auto"
         with patch.dict(sys.modules, {"open_webui.env": None}):
             self.assertFalse(self.tool._use_inline())
+
+    async def test_inline_timeout_matches_server_limits(self):
+        env = types.ModuleType("open_webui.env")
+        package = types.ModuleType("open_webui")
+        with patch.dict(sys.modules, {"open_webui": package, "open_webui.env": env}):
+            for version, expected in (
+                ("0.11.1", None),
+                ("0.11.4", None),
+                ("0.12.0", 240_000),
+                ("0.13.4", 240_000),
+                ("unknown", 240_000),
+            ):
+                with self.subTest(version=version):
+                    env.__dict__["VERSION"] = version
+                    _, caller = await self.invoke(
+                        inline_response({"type": "other", "text": "Python"})
+                    )
+                    self.assertEqual(
+                        caller.call_args.args[0]["data"]["timeout_ms"], expected
+                    )
 
     def test_model_facing_signature_is_simple(self):
         public = [
